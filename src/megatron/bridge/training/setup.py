@@ -63,10 +63,10 @@ from megatron.bridge.training.utils.train_utils import start_memory_history_reco
 from megatron.bridge.utils.common_utils import get_rank_safe, print_rank_0
 
 
-try:
-    from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV1 as megatron_FSDP
-except ImportError:
-    from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+    FullyShardedDataParallelV1,
+    FullyShardedDataParallelV2,
+)
 
 
 class SetupOutput(NamedTuple):
@@ -542,7 +542,17 @@ def _update_model_config_funcs(
     pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> None:
     """Update model config sync funcs based on initialized model."""
-    if isinstance(model[0], (DistributedDataParallel, megatron_FSDP)) and ddp_config.overlap_grad_reduce:
+    if (
+        isinstance(
+            model[0],
+            (
+                DistributedDataParallel,
+                FullyShardedDataParallelV1,
+                FullyShardedDataParallelV2,
+            ),
+        )
+        and ddp_config.overlap_grad_reduce
+    ):
         assert model_config.no_sync_func is None, (
             "When overlap_grad_reduce is True, config.no_sync_func must be None; "
             "a custom no_sync_func is not supported when overlapping grad-reduce"
