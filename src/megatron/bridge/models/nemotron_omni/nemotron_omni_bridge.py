@@ -14,9 +14,10 @@
 
 """Nemotron Omni conversion bridges.
 
-Standalone bridge for the Nemotron-3 Omni family (HF architecture
-``NemotronH_Nano_Omni_Reasoning_V3``). Inherits the language / vision /
-mamba parameter mappings from :class:`NemotronVLBridge` and adds:
+Standalone bridge for the Nemotron-3 Omni family (HF architectures
+``NemotronH_Nano_Omni_Reasoning_V3``, ``NemotronH_Omni_Reasoning_V3``,
+and ``NemotronH_Super_Omni_Reasoning_V3``). Inherits the language /
+vision / mamba parameter mappings from :class:`NemotronVLBridge` and adds:
 
 - Omni-specific ``CONFIG_MAPPING`` entries (Mamba shape fields used by the
   hybrid LLM and the MoE shared-expert intermediate size).
@@ -59,6 +60,14 @@ from megatron.bridge.models.nemotron_omni.nemotron_omni_provider import (
 from megatron.bridge.models.nemotron_vl.nemotron_vl_bridge import NemotronVLBridge
 from megatron.bridge.models.nemotronh.nemotron_h_bridge import NemotronHBridge
 
+_HF_LAYER_TYPE_TO_MEGATRON_PATTERN = {
+    "attention": "*",
+    "full_attention": "*",
+    "linear_attention": "M",
+    "mamba": "M",
+    "moe": "E",
+}
+
 
 def _copy_mapping_with_prefixes(mapping, *, megatron_prefix: str, hf_prefix: str):
     """Copy a mapping while preserving its conversion implementation."""
@@ -72,11 +81,27 @@ def _copy_mapping_with_prefixes(mapping, *, megatron_prefix: str, hf_prefix: str
     return copied
 
 
+def _layer_types_to_megatron_pattern(layer_types, *, field_name: str) -> str | None:
+    """Translate a Transformers Nemotron-H layer list to Megatron symbols."""
+    if not layer_types:
+        return None
+    try:
+        return "".join(_HF_LAYER_TYPE_TO_MEGATRON_PATTERN[layer_type] for layer_type in layer_types)
+    except KeyError as error:
+        raise ValueError(f"Unsupported Nemotron Omni layer type {error.args[0]!r} in {field_name}.") from error
+
+
 @MegatronModelBridge.register_bridge(
     source="NemotronH_Nano_Omni_Reasoning_V3",
     target=NemotronOmniModel,
     provider=NemotronOmniModelProvider,
     model_type="NemotronH_Nano_Omni_Reasoning_V3",
+)
+@MegatronModelBridge.register_bridge(
+    source="NemotronH_Omni_Reasoning_V3",
+    target=NemotronOmniModel,
+    provider=NemotronOmniModelProvider,
+    model_type="NemotronH_Omni_Reasoning_V3",
 )
 @MegatronModelBridge.register_bridge(
     source="NemotronH_Super_Omni_Reasoning_V3",
@@ -162,6 +187,11 @@ from .configuration_radio import RADIOConfig as _RADIOConfig
 
         provider_kwargs["num_layers"] = None
         provider_kwargs["make_vocab_size_divisible_by"] = self.make_vocab_size_divisible_by(llm_config.vocab_size)
+        if not provider_kwargs.get("hybrid_layer_pattern"):
+            provider_kwargs["hybrid_layer_pattern"] = _layer_types_to_megatron_pattern(
+                getattr(llm_config, "layers_block_type", None),
+                field_name="layers_block_type",
+            )
 
         if hasattr(hf_config, "projector_hidden_size"):
             provider_kwargs["vision_proj_ffn_hidden_size"] = hf_config.projector_hidden_size
@@ -204,6 +234,16 @@ from .configuration_radio import RADIOConfig as _RADIOConfig
 
         provider = NemotronOmniModelProvider(**provider_kwargs)
         provider.mtp_hybrid_override_pattern = getattr(llm_config, "mtp_hybrid_override_pattern", None)
+        if provider.mtp_num_layers and not provider.mtp_hybrid_override_pattern:
+            provider.mtp_hybrid_override_pattern = _layer_types_to_megatron_pattern(
+                getattr(llm_config, "mtp_layers_block_type", None),
+                field_name="mtp_layers_block_type",
+            )
+            if not provider.mtp_hybrid_override_pattern:
+                raise ValueError(
+                    "Nemotron Omni configs with MTP enabled must define "
+                    "mtp_hybrid_override_pattern or mtp_layers_block_type."
+                )
         return provider
 
     @classmethod
@@ -294,6 +334,8 @@ from .configuration_radio import RADIOConfig as _RADIOConfig
 
         hf_config = getattr(self, "hf_config", None)
         llm_config = getattr(hf_config, "llm_config", None)
+        architectures = getattr(hf_config, "architectures", ())
+        mtp_hf_prefix = "language_model." if "NemotronH_Omni_Reasoning_V3" in architectures else ""
 
         language_bridge = NemotronHBridge()
         language_bridge.hf_config = llm_config
@@ -303,9 +345,10 @@ from .configuration_radio import RADIOConfig as _RADIOConfig
                 _copy_mapping_with_prefixes(
                     mapping,
                     megatron_prefix="language_model.",
-                    # The public Omni checkpoint keeps MTP at the top level,
-                    # while the rest of NemotronH lives under language_model.
-                    hf_prefix="" if is_mtp else "language_model.",
+                    # Nano/Super-named Omni checkpoints keep MTP at the top
+                    # level. The generic V3 checkpoint nests it alongside the
+                    # rest of NemotronH under language_model.
+                    hf_prefix=mtp_hf_prefix if is_mtp else "language_model.",
                 )
             )
 

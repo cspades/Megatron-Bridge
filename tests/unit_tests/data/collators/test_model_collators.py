@@ -52,6 +52,7 @@ def test_model_collate_registry_rejects_unknown_processor():
 
 def test_always_use_model_collate_selection():
     assert always_use_model_collate("NemotronH_Nano_Omni_Reasoning_V3Processor")
+    assert always_use_model_collate("NemotronH_Omni_Reasoning_V3Processor")
     assert always_use_model_collate("deepseek-v4")
     assert not always_use_model_collate("Qwen3VLProcessor")
     assert not always_use_model_collate("UnknownProcessor")
@@ -61,6 +62,7 @@ def test_nemotron_omni_registry_selects_canonical_expanded_contract():
     assert (
         resolve_model_collate("NemotronH_Nano_Omni_Reasoning_V3Processor") is collate.nemotron_omni_expanded_collate_fn
     )
+    assert resolve_model_collate("NemotronH_Omni_Reasoning_V3Processor") is collate.nemotron_omni_expanded_collate_fn
 
 
 def test_vlm_collate_keeps_qwen_vl_registration():

@@ -139,6 +139,11 @@ def test_public_nemotron_omni_architecture_is_registered():
     assert AutoBridge.supports(hf_config)
     assert isinstance(get_model_bridge("NemotronH_Nano_Omni_Reasoning_V3", hf_config=hf_config), NemotronOmniBridge)
 
+    hf_config.architectures = ["NemotronH_Omni_Reasoning_V3"]
+    hf_config.auto_map = {"AutoModelForCausalLM": "modeling.NemotronH_Omni_Reasoning_V3"}
+    assert AutoBridge.supports(hf_config)
+    assert isinstance(get_model_bridge("NemotronH_Omni_Reasoning_V3", hf_config=hf_config), NemotronOmniBridge)
+
     hf_config.architectures = ["NemotronH_Super_Omni_Reasoning_V3"]
     assert AutoBridge.supports(hf_config)
     assert isinstance(get_model_bridge("NemotronH_Super_Omni_Reasoning_V3", hf_config=hf_config), NemotronOmniBridge)
@@ -235,6 +240,28 @@ def test_nemotron_omni_provider_bridge_omits_sound_when_config_is_absent():
     assert provider.sound_context_token_id == 0
 
 
+def test_generic_omni_provider_derives_super_layer_patterns():
+    hf_config = _mock_omni_hf_config()
+    hf_config.architectures = ["NemotronH_Omni_Reasoning_V3"]
+    hf_config.auto_map = {"AutoModelForCausalLM": "modeling.NemotronH_Omni_Reasoning_V3"}
+    hf_config.sound_config = None
+    del hf_config.llm_config.hybrid_override_pattern
+    hf_config.llm_config.layers_block_type = ["mamba", "moe", "attention"]
+    hf_config.llm_config.num_nextn_predict_layers = 1
+    hf_config.llm_config.mtp_layers_block_type = ["attention", "moe"]
+    hf_pretrained = Mock(spec=PreTrainedCausalLM)
+    hf_pretrained.config = hf_config
+
+    bridge = get_model_bridge("NemotronH_Omni_Reasoning_V3", hf_config=hf_config)
+    provider = bridge.provider_bridge(hf_pretrained)
+
+    assert isinstance(bridge, NemotronOmniBridge)
+    assert provider.has_sound is False
+    assert provider.hybrid_layer_pattern == "ME*"
+    assert provider.mtp_num_layers == 1
+    assert provider.mtp_hybrid_override_pattern == "*E"
+
+
 def test_nemotron_omni_hf_config_export_preserves_sound_capability():
     provider = NemotronOmniModelProvider(
         has_sound=True,
@@ -267,6 +294,34 @@ def test_nemotron_omni_provider_rejects_static_resolution():
 
     with pytest.raises(ValueError, match="only supports dynamic_resolution=True"):
         provider.finalize()
+
+
+def test_nemotron_omni_provider_truncates_backbone_and_disables_mtp():
+    provider = NemotronOmniModelProvider(
+        hybrid_layer_pattern="ME*E",
+        num_layers=4,
+        mtp_num_layers=1,
+        mtp_hybrid_override_pattern="*E",
+        truncate_num_layers=2,
+    )
+
+    provider._apply_layer_truncation()
+
+    assert provider.hybrid_layer_pattern == "ME"
+    assert provider.num_layers is None
+    assert provider.mtp_num_layers == 0
+    assert provider.mtp_hybrid_override_pattern is None
+
+
+@pytest.mark.parametrize("truncate_num_layers", [0, -1, 5])
+def test_nemotron_omni_provider_rejects_invalid_truncation(truncate_num_layers):
+    provider = NemotronOmniModelProvider(
+        hybrid_layer_pattern="ME*E",
+        truncate_num_layers=truncate_num_layers,
+    )
+
+    with pytest.raises(ValueError, match="truncate_num_layers"):
+        provider._apply_layer_truncation()
 
 
 @pytest.mark.parametrize("image_token_index", [0, -1])
@@ -494,6 +549,26 @@ def test_canonical_mapping_registry_uses_top_level_model_names():
         == "language_model.mtp.layers.0.mtp_model_layer.layers.1.self_attention.linear_qkv.weight"
     )
     assert all(not mapping.megatron_param.startswith("llava_model.") for mapping in registry.mappings)
+
+
+def test_generic_omni_mapping_registry_nests_mtp_under_language_model():
+    bridge = NemotronOmniBridge()
+    bridge.hf_config = _mock_omni_hf_config()
+    bridge.hf_config.architectures = ["NemotronH_Omni_Reasoning_V3"]
+    bridge.hf_config.llm_config.mtp_hybrid_override_pattern = "*E"
+    bridge.hf_config.llm_config.num_nextn_predict_layers = 1
+    registry = bridge.mapping_registry()
+
+    mtp_expert = registry.megatron_to_hf_lookup(
+        "language_model.mtp.layers.0.mtp_model_layer.layers.1.mlp.experts.linear_fc2.weight511"
+    )
+    reverse_mtp_qkv = registry.hf_to_megatron_lookup("language_model.mtp.layers.1.mixer.q_proj.weight")
+
+    assert mtp_expert.hf_param == "language_model.mtp.layers.1.mixer.experts.511.down_proj.weight"
+    assert (
+        reverse_mtp_qkv.megatron_param
+        == "language_model.mtp.layers.0.mtp_model_layer.layers.1.self_attention.linear_qkv.weight"
+    )
 
 
 def test_llava_bridge_retains_legacy_wrapper_namespace():

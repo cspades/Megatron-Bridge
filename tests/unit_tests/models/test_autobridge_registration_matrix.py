@@ -66,6 +66,9 @@ EXPECTED_REGISTRATIONS = {
     "NemotronH_Nano_Omni_Reasoning_V3": (
         "megatron.bridge.models.nemotron_omni.nemotron_omni_bridge.NemotronOmniBridge"
     ),
+    "NemotronH_Omni_Reasoning_V3": (
+        "megatron.bridge.models.nemotron_omni.nemotron_omni_bridge.NemotronOmniBridge"
+    ),
     "NemotronH_Super_Omni_Reasoning_V3": (
         "megatron.bridge.models.nemotron_omni.nemotron_omni_bridge.NemotronOmniBridge"
     ),
@@ -120,6 +123,7 @@ STRING_REGISTRATIONS = {
     "MuseGlimmerForConditionalGeneration",
     "NemotronHForCausalLM",
     "NemotronH_Nano_Omni_Reasoning_V3",
+    "NemotronH_Omni_Reasoning_V3",
     "NemotronH_Super_Omni_Reasoning_V3",
     "NemotronLabsDiffusionModel",
     "Qwen3ASRForConditionalGeneration",

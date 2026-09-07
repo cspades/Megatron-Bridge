@@ -193,6 +193,38 @@ class _NemotronOmniModelProviderBase(NemotronVLModelProvider):
     # checkpoint whose provider had the same class name but LLaVA semantics
     # from being loaded as the canonical expanded-sequence implementation.
     nemotron_omni_contract: Optional[str] = None
+    # Debug/smoke-only option: retain a prefix of the language backbone.
+    # Source checkpoint layers beyond this prefix are intentionally ignored.
+    truncate_num_layers: Optional[int] = None
+
+    def _apply_layer_truncation(self) -> None:
+        truncate_num_layers = self.truncate_num_layers
+        if truncate_num_layers is None:
+            return
+        if (
+            not isinstance(truncate_num_layers, int)
+            or isinstance(truncate_num_layers, bool)
+            or truncate_num_layers <= 0
+        ):
+            raise ValueError("truncate_num_layers must be a positive integer.")
+        if not self.hybrid_layer_pattern:
+            raise ValueError("truncate_num_layers requires hybrid_layer_pattern.")
+
+        main_pattern = self.hybrid_layer_pattern.split("/", 1)[0]
+        if truncate_num_layers > len(main_pattern):
+            raise ValueError(
+                f"truncate_num_layers={truncate_num_layers} exceeds the "
+                f"{len(main_pattern)} checkpoint layers."
+            )
+        if truncate_num_layers == len(main_pattern):
+            return
+
+        self.hybrid_layer_pattern = main_pattern[:truncate_num_layers]
+        self.num_layers = None
+        # A checkpoint's MTP head was trained against the full backbone.
+        # Disable it for a truncated debug model.
+        self.mtp_num_layers = 0
+        self.mtp_hybrid_override_pattern = None
 
     def _validate_omni_config(self) -> None:
         if self.dynamic_resolution is not True:
@@ -212,6 +244,7 @@ class _NemotronOmniModelProviderBase(NemotronVLModelProvider):
 
     def finalize(self) -> None:
         """Finalize a dynamic-resolution Nemotron Omni provider."""
+        self._apply_layer_truncation()
         self._validate_omni_config()
         super().finalize()
 
