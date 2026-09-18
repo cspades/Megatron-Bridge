@@ -127,7 +127,11 @@ class MegatronMIMOParallelismConfig:
         return max(ranges) if ranges else 0
 
     def _validate_heterogeneous(self, world_size: int) -> None:
-        """Validate heterogeneous deployment: rank ranges tile [0, world_size)."""
+        """Validate that module rank ranges collectively tile the world.
+
+        Exact duplicate ranges are intentional colocated modules. Partial
+        overlaps remain invalid because they cannot describe a single rank role.
+        """
         ranges = []
         for name, parallelism in self.module_parallelisms.items():
             if parallelism.data_parallel_size is None:
@@ -135,14 +139,19 @@ class MegatronMIMOParallelismConfig:
             ranges.append((parallelism.rank_offset, parallelism.rank_offset + parallelism.total_ranks, name))
 
         ranges.sort(key=lambda x: x[0])
-        for idx in range(1, len(ranges)):
-            prev_end = ranges[idx - 1][1]
-            cur_start = ranges[idx][0]
-            if cur_start < prev_end:
-                raise ValueError("rank_offset ranges overlap in heterogeneous deployment.")
+        unique_ranges = []
+        for start, end, name in ranges:
+            if unique_ranges and (start, end) == unique_ranges[-1][:2]:
+                continue
+            if unique_ranges and start < unique_ranges[-1][1]:
+                raise ValueError(
+                    "Module rank ranges may be disjoint or exactly colocated; "
+                    f"module '{name}' partially overlaps another range."
+                )
+            unique_ranges.append((start, end, name))
 
         expected_start = 0
-        for start, end, name in ranges:
+        for start, end, name in unique_ranges:
             if start != expected_start:
                 raise ValueError(
                     "rank_offset ranges must tile the distributed world with no gaps; "

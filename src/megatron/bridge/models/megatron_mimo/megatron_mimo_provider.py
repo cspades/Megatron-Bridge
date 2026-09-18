@@ -478,6 +478,11 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
             mimo_model_kwargs["cp_group"] = llm_pg.cp
             mimo_model_kwargs["tp_group"] = llm_pg.tp
         megatron_mimo_model = MimoModel(mimo_model_config, **mimo_model_kwargs)
+        # Stock NeMo-RL/Bridge helpers query the outer model for one canonical
+        # collection. Language owns logits and loss, so its collection is the
+        # correct default while inner DDP modules retain their own collections.
+        if llm_pg is not None:
+            megatron_mimo_model.pg_collection = llm_pg
 
         # Apply freezing
         self._apply_freezing(megatron_mimo_model)
@@ -561,6 +566,12 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
 
         # Get the model
         model = self.provide()
+        # MimoModel proxies the DDP lifecycle of its independently wrapped
+        # submodules. Stock pipeline schedules inspect ddp_config on the model
+        # chunk itself, so expose the shared wrapping config on the outer
+        # container as well.
+        if ddp_config is not None:
+            model.ddp_config = ddp_config
         model_list = [model]
 
         # Resolve hooks
