@@ -224,12 +224,57 @@ from .configuration_radio import RADIOConfig as _RADIOConfig
         # this config, causing it to fall back to silu. Override explicitly.
         provider_kwargs["activation_func"] = squared_relu
 
-        # Temporal video embedder: pull settings from HF vision_config when the
-        # checkpoint was trained with a separate video patch embedder.
+        # RADIO's HF contract is explicit: a non-None
+        # ``video_temporal_patch_size`` constructs a distinct
+        # ``video_patch_projection`` and video forward selects it. MCore names
+        # those same properties ``temporal_patch_dim`` and
+        # ``separate_video_embedder``.
         vision_cfg = getattr(hf_config, "vision_config", None)
-        if vision_cfg is not None and getattr(vision_cfg, "separate_video_embedder", False):
-            provider_kwargs["separate_video_embedder"] = True
-            provider_kwargs["temporal_patch_dim"] = getattr(vision_cfg, "video_temporal_patch_size", 2)
+        vision_temporal_patch_dim = (
+            getattr(vision_cfg, "video_temporal_patch_size", None)
+            if vision_cfg is not None
+            else None
+        )
+        root_temporal_patch_dim = getattr(hf_config, "video_temporal_patch_size", None)
+        if (
+            vision_temporal_patch_dim is not None
+            and root_temporal_patch_dim is not None
+            and vision_temporal_patch_dim != root_temporal_patch_dim
+        ):
+            raise ValueError(
+                "Conflicting video_temporal_patch_size values in the HF config: "
+                f"vision_config={vision_temporal_patch_dim}, "
+                f"root={root_temporal_patch_dim}."
+            )
+        temporal_patch_dim = (
+            vision_temporal_patch_dim
+            if vision_temporal_patch_dim is not None
+            else root_temporal_patch_dim
+        )
+        separate_video_embedder = temporal_patch_dim is not None
+        if temporal_patch_dim is None:
+            temporal_patch_dim = 1
+        if isinstance(temporal_patch_dim, bool) or not isinstance(temporal_patch_dim, int):
+            raise TypeError(
+                "video_temporal_patch_size must be an integer, got "
+                f"{type(temporal_patch_dim).__name__}."
+            )
+        if temporal_patch_dim < 1:
+            raise ValueError(
+                "video_temporal_patch_size must be positive, got "
+                f"{temporal_patch_dim}."
+            )
+        if separate_video_embedder and temporal_patch_dim == 1:
+            raise ValueError(
+                "MCore RADIO cannot represent the HF video projection contract "
+                "when video_temporal_patch_size is 1; it must be greater than 1."
+            )
+
+        provider_kwargs["separate_video_embedder"] = separate_video_embedder
+        provider_kwargs["temporal_patch_dim"] = temporal_patch_dim
+        if temporal_patch_dim > 1:
+            # HF checkpoints may store a 2D patch embedder. MCore's load hook
+            # deterministically inflates it to the configured tubelet width.
             provider_kwargs["temporal_ckpt_compat"] = True
 
         provider = NemotronOmniModelProvider(**provider_kwargs)

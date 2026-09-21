@@ -106,7 +106,6 @@ def _mock_omni_hf_config():
         convolution_bias=False,
     )
     vision_config = _DictConfig(
-        separate_video_embedder=True,
         video_temporal_patch_size=2,
     )
     return _DictConfig(
@@ -225,6 +224,40 @@ def test_nemotron_omni_provider_bridge_maps_public_config_fields():
     assert serialized["nemotron_omni_contract"] == NEMOTRON_OMNI_EXPANDED_SEQUENCE_CONTRACT
     assert serialized["has_sound"] is True
     assert "add_sound_encoder" not in serialized
+
+
+def test_nemotron_omni_provider_derives_video_embedder_from_radio_temporal_config():
+    hf_config = _mock_omni_hf_config()
+    hf_pretrained = Mock(spec=PreTrainedCausalLM)
+    hf_pretrained.config = hf_config
+
+    provider = NemotronOmniBridge().provider_bridge(hf_pretrained)
+
+    assert provider.separate_video_embedder is True
+    assert provider.temporal_patch_dim == 2
+    assert provider.temporal_ckpt_compat is True
+
+
+def test_nemotron_omni_provider_rejects_conflicting_temporal_patch_sizes():
+    hf_config = _mock_omni_hf_config()
+    hf_config.video_temporal_patch_size = 4
+    hf_pretrained = Mock(spec=PreTrainedCausalLM)
+    hf_pretrained.config = hf_config
+
+    with pytest.raises(ValueError, match="Conflicting video_temporal_patch_size"):
+        NemotronOmniBridge().provider_bridge(hf_pretrained)
+
+
+def test_nemotron_omni_provider_without_video_temporal_config_uses_image_embedder():
+    hf_config = _mock_omni_hf_config()
+    del hf_config.vision_config.video_temporal_patch_size
+    hf_pretrained = Mock(spec=PreTrainedCausalLM)
+    hf_pretrained.config = hf_config
+
+    provider = NemotronOmniBridge().provider_bridge(hf_pretrained)
+
+    assert provider.separate_video_embedder is False
+    assert provider.temporal_patch_dim == 1
 
 
 def test_nemotron_omni_provider_bridge_omits_sound_when_config_is_absent():
