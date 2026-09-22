@@ -420,7 +420,6 @@ class Nemotron35SuperVLBridge(NemotronOmniBridge):
         # The Super-VL checkpoint carries a trained video embedder. Do not
         # synthesize one from image weights if that parameter is missing.
         provider.temporal_ckpt_compat = False
-        provider.vision_final_layernorm = bool(provider.mtp_num_layers)
         return provider
 
     @classmethod
@@ -480,23 +479,6 @@ class Nemotron35SuperVLBridge(NemotronOmniBridge):
     def _mtp_hf_prefix(self) -> str:
         """Nemotron 3.5 Super VL nests MTP below ``language_model``."""
         return "language_model."
-
-    def mapping_registry(self) -> MegatronMappingRegistry:
-        """Add the Super-VL vision final norm to the shared Omni mappings."""
-        mappings = list(super().mapping_registry().mappings)
-        mappings.extend(
-            [
-                AutoMapping(
-                    megatron_param="vision_model.decoder.final_layernorm.weight",
-                    hf_param="vision_projector.vision_final_layernorm.weight",
-                ),
-                AutoMapping(
-                    megatron_param="vision_model.decoder.final_layernorm.bias",
-                    hf_param="vision_projector.vision_final_layernorm.bias",
-                ),
-            ]
-        )
-        return MegatronMappingRegistry(*mappings)
 
 
 class NemotronOmniLlavaBridge(NemotronOmniBridge):
