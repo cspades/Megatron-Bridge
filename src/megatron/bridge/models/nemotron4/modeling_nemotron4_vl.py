@@ -140,6 +140,22 @@ class Nemotron4VLModel(NemotronOmniModel):
             self.vision_model.register_load_state_dict_post_hook(_ignore_transformer_engine_extra_state)
             self.vision_projection.register_load_state_dict_post_hook(_ignore_transformer_engine_extra_state)
 
+    def forward(self, *args, image_sizes: torch.Tensor | None = None, **kwargs):
+        """Run :meth:`NemotronOmniModel.forward`, also accepting HF's ``image_sizes`` name.
+
+        The Nemotron4 HF processor emits ``pixel_values`` and ``image_sizes``; Omni's forward takes
+        ``pixel_values`` but calls the sizes ``imgs_sizes`` and silently drops unknown keywords,
+        which would surface later as a missing-``imgs_sizes`` error.
+
+        Raises:
+            ValueError: If both ``image_sizes`` and ``imgs_sizes`` are given.
+        """
+        if image_sizes is not None:
+            if kwargs.get("imgs_sizes") is not None:
+                raise ValueError("Pass image sizes as either imgs_sizes or image_sizes, not both.")
+            kwargs["imgs_sizes"] = image_sizes
+        return super().forward(*args, **kwargs)
+
     def _encode_images(
         self,
         images: torch.Tensor,

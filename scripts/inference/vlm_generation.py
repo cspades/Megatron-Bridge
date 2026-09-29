@@ -247,6 +247,7 @@ def main(args) -> None:
     is_gemma4 = "gemma4" in model_type
     is_minimax = model_type == "minimax_m3_vl"
     is_mistral3 = model_type == "mistral3"
+    is_nemotron4 = model_type == "nemotron4"
     is_omni = is_nemotron_omni(config)
 
     # ------------------------------------------------------------------
@@ -408,6 +409,7 @@ def main(args) -> None:
             is_kimi=is_kimi,
             is_minimax=is_minimax,
             is_mistral3=is_mistral3,
+            is_nemotron4=is_nemotron4,
             image_token_id=image_token_id,
         )
 

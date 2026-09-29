@@ -211,6 +211,7 @@ def process_image_inputs(
     is_kimi: bool = False,
     is_minimax: bool = False,
     is_mistral3: bool = False,
+    is_nemotron4: bool = False,
     image_token_id: Optional[int] = None,
 ):
     """Process image + prompt into model inputs.
@@ -234,6 +235,9 @@ def process_image_inputs(
     if is_minimax:
         return _process_minimax_inputs(processor, image_path, prompt)
 
+    if is_nemotron4:
+        return _process_nemotron4_inputs(processor, image_path, prompt)
+
     return _process_default_inputs(processor, image_path, prompt, allow_raw_prompt=is_mistral3)
 
 
@@ -252,6 +256,21 @@ def _process_kimi_inputs(processor, image_path, prompt, image_token_id):
     grid_thws = getattr(inputs, "grid_thws", None)
     input_ids = pre_expand_vision_tokens(inputs.input_ids, grid_thws, image_token_id)
     return input_ids, inputs.pixel_values, grid_thws, None, None, None
+
+
+def _process_nemotron4_inputs(processor, image_path, prompt):
+    """Format Nemotron4 input: the processor's image placeholder followed by the raw prompt.
+
+    Nemotron4's chat template takes string message content only, and its processor does its own
+    resizing, so neither the list-content chat path nor ``process_vision_info`` applies. The
+    processor expands the placeholder into the row-structured ``<img>`` / ``<image_break>`` tokens.
+    """
+    inputs = processor(
+        text=processor.image_token + prompt,
+        images=[load_image(image_path)],
+        return_tensors="pt",
+    )
+    return inputs.input_ids, inputs.pixel_values, None, inputs.image_sizes, None, None
 
 
 def _process_minimax_inputs(processor, image_path, prompt):
