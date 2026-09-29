@@ -219,6 +219,24 @@ from megatron.bridge.models.stepfun import (
 from megatron.bridge.models.t5_provider import T5ModelProvider
 
 
+# Nemotron4 needs MCore's Pixtral-style ViT and shortcut-MoE blocks, which upstream Megatron-LM does
+# not ship yet; register it only when the installed MCore provides them. Imported after every other
+# family because nemotron4 -> nemotron_omni -> nemotron_vl imports names from this package.
+_NEMOTRON4_EXPORTS = []
+if (
+    importlib.util.find_spec("megatron.core.models.vision.vit_model") is not None
+    and importlib.util.find_spec("megatron.core.models.hybrid.shortcut_block") is not None
+):
+    from megatron.bridge.models.nemotron4 import (
+        Nemotron4Bridge,
+        Nemotron4ModelProvider,
+        Nemotron4VLModel,
+        Nemotron4VLModelProvider,
+    )
+
+    _NEMOTRON4_EXPORTS = ["Nemotron4Bridge", "Nemotron4ModelProvider", "Nemotron4VLModel", "Nemotron4VLModelProvider"]
+
+
 __all__ = [
     "AutoBridge",
     "MegatronMappingRegistry",
@@ -348,3 +366,4 @@ __all__ = [
     "ExaoneMoeBridge",
     "ExaoneMoeModelProvider",
 ] + _BAGEL_EXPORTS
+__all__ += _NEMOTRON4_EXPORTS
