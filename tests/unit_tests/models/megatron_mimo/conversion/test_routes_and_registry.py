@@ -33,6 +33,22 @@ from megatron.bridge.models.megatron_mimo.megatron_mimo_config import (
 from megatron.bridge.models.megatron_mimo.megatron_mimo_provider import MegatronMIMOProvider
 
 
+def test_encoder_and_projector_routes_share_component():
+    routes = [
+        MIMOComponent("language", "language_model.", "language_model"),
+        MIMOComponent("vision", "vision_model.", "modality_submodules.vision.encoders.vit"),
+        MIMOComponent("projector", "vision_projection.", "modality_submodules.vision.input_projections.0", "vision"),
+    ]
+    validate_route_table(
+        routes, parallelism_config=_two_component_config(), modality_submodules_spec={"vision": object()}
+    )
+    with pytest.raises(ValueError, match="not present"):
+        validate_route_table(
+            routes + [MIMOComponent("audio", "audio.", "audio", "missing")],
+            parallelism_config=_two_component_config(),
+        )
+
+
 def _two_component_config() -> MegatronMIMOParallelismConfig:
     return MegatronMIMOParallelismConfig(
         module_parallelisms={

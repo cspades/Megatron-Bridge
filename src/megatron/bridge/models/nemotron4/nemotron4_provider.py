@@ -31,19 +31,22 @@ settings as new, silently ignored fields on an MCore that lacks them.
 import copy
 import dataclasses
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, ClassVar
 
 import torch
 from megatron.core import parallel_state
 from megatron.core.activations import squared_relu
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TERowParallelLinear
+from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
+from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
+from megatron.core.models.vision.vit_model import ViTModel
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig as MCoreTransformerConfig
 
 from megatron.bridge.models.hybrid.hybrid_provider import HybridModelProvider
-from megatron.bridge.models.nemotron4.modeling_nemotron4_vl import Nemotron4VLModel
+from megatron.bridge.models.nemotron4.modeling_nemotron4_vl import Nemotron4MIMOLanguageModel, Nemotron4VLModel
 
 
 # Nano/WSM: 32 GDP ("M"), 4 dense MLP ("-"), 8 attention ("*"), 28 MoE ("E"), then two MTP depths.
@@ -212,6 +215,7 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
     """
 
     image_token_index: int = 18
+    mimo_supports_mtp: ClassVar[bool] = True
 
     # Pixtral-style ViT (Mistral-ViT "1.6b").
     vision_num_layers: int = 30
@@ -232,6 +236,77 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
     freeze_language_model: bool = False
     freeze_vision_model: bool = False
     freeze_vision_projection: bool = False
+
+    @property
+    def special_token_ids(self) -> dict[str, int]:
+        """Return the image placeholder used by MegatronMIMO."""
+        return {"images": self.image_token_index}
+
+    def build_language_model_spec(self, pp_rank: int = 0) -> ModuleSpec:
+        """Build the same hybrid language stack as the standard Nemotron4 VLM."""
+        if self.tensor_model_parallel_size != 1 or self.pipeline_model_parallel_size != 1 or pp_rank != 0:
+            raise ValueError("Nemotron4 MIMO conversion requires language TP=1 and PP=1.")
+        config = self._copy_config_without_runtime_process_groups(deep=True)
+        config.finalize()
+        return ModuleSpec(
+            module=Nemotron4MIMOLanguageModel,
+            params={
+                "config": config,
+                "hybrid_stack_spec": config._resolve_hybrid_stack_spec(),
+                "vocab_size": config.vocab_size,
+                "max_sequence_length": config.seq_length,
+                "hybrid_layer_pattern": config.hybrid_layer_pattern,
+                "fp16_lm_cross_entropy": config.fp16_lm_cross_entropy,
+                "logit_dtype": config.logit_dtype,
+                "parallel_output": config.parallel_output,
+                "share_embeddings_and_output_weights": config.share_embeddings_and_output_weights,
+                "position_embedding_type": config.position_embedding_type,
+                "pre_process": True,
+                "post_process": True,
+            },
+        )
+
+    def build_mimo_modality_submodules_spec(self) -> dict[str, ModuleSpec]:
+        """Build a Pixtral encoder and separate projector on the image component."""
+        language_config = self._copy_config_without_runtime_process_groups(deep=True)
+        vision_config = _dense_config(self._build_vision_config(language_config))
+        projection_config = _dense_config(self._build_vision_projection_config(language_config))
+        return {
+            "images": ModuleSpec(
+                module=VisionModalitySubmodules,
+                submodules={
+                    "encoders": {
+                        "pixtral": ModuleSpec(
+                            module=ViTModel,
+                            params={
+                                "transformer_config": vision_config,
+                                "transformer_layer_spec": get_vit_layer_with_transformer_engine_spec(),
+                                "patch_dim": self.patch_dim,
+                                "img_h": self.img_h,
+                                "img_w": self.img_w,
+                                "add_class_token": False,
+                                "class_token_len": 0,
+                                "ln_pre": True,
+                                "pos_emb_type": "rope2d",
+                                "use_merger": self.spatial_merge_size > 1,
+                                "spatial_merge_size": self.spatial_merge_size,
+                            },
+                        )
+                    },
+                    "input_projections": [
+                        ModuleSpec(
+                            module=MultimodalProjector,
+                            params={
+                                "config": projection_config,
+                                "submodules": nemotron4_projection_submodules(),
+                                "projector_type": "mlp",
+                                "input_size": self.vision_hidden_size,
+                            },
+                        )
+                    ],
+                },
+            )
+        }
 
     def _build_vision_config(self, language_cfg: "Nemotron4VLModelProvider") -> "Nemotron4VLModelProvider":
         """Derive the ViT config from a language config copy.
@@ -377,3 +452,15 @@ def _make_replicated_single_stage(config: MCoreTransformerConfig) -> None:
     config.recompute_granularity = None
     config.recompute_method = None
     config.recompute_num_layers = None
+
+
+def _dense_config(config: Nemotron4VLModelProvider) -> MCoreTransformerConfig:
+    # Encoder/projector configs must not run HybridModelProvider.finalize(), which
+    # would overwrite their layer counts with the language pattern's layer count.
+    config.mtp_hsm = False
+    config.moe_router_load_balancing_type = "aux_loss"
+    config.expert_model_parallel_size = 1
+    config.expert_tensor_parallel_size = 1
+    return MCoreTransformerConfig(
+        **{f.name: getattr(config, f.name) for f in dataclasses.fields(MCoreTransformerConfig) if f.init}
+    )

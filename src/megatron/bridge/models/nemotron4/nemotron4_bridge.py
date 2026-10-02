@@ -66,6 +66,9 @@ from megatron.bridge.models.conversion.param_mapping import (
     RowParallelMapping,
 )
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
+from megatron.bridge.models.megatron_mimo.conversion import MIMOComponent, register_mimo_conversion_spec
+from megatron.bridge.models.megatron_mimo.megatron_mimo_config import MegatronMIMOParallelismConfig
+from megatron.bridge.models.megatron_mimo.megatron_mimo_provider import MegatronMIMOProvider
 from megatron.bridge.models.nemotron4.modeling_nemotron4_vl import Nemotron4VLModel
 from megatron.bridge.models.nemotron4.nemotron4_provider import Nemotron4VLModelProvider, require_nemotron4_mcore
 
@@ -505,3 +508,47 @@ def _validate_hf_config(hf_config) -> None:
         )
     if vision.num_attention_heads * vision.head_dim != vision.hidden_size:
         raise ValueError("Nemotron4 vision_config requires num_attention_heads * head_dim == hidden_size.")
+
+
+@register_mimo_conversion_spec(Nemotron4Bridge)
+def nemotron4_mimo_conversion_spec(
+    source_bridge: Nemotron4Bridge,
+    hf_pretrained: PreTrainedCausalLM,
+    parallelism_config: MegatronMIMOParallelismConfig,
+) -> tuple[MegatronMIMOProvider, list[MIMOComponent]]:
+    """Reuse Nemotron4's weight mappings with separate language and image grids.
+
+    The projector shares the image grid but has its own route and parameter
+    prefix. Language EP is supported by the existing fused-expert mappings;
+    language TP/PP and image TP/PP/CP/EP/ETP are restricted to one.
+    """
+    components = parallelism_config.module_parallelisms
+    if set(components) != {"language", "images"}:
+        raise ValueError("Nemotron4 MIMO conversion requires components 'language' and 'images'.")
+    for name, component in components.items():
+        restricted = ["tensor_model_parallel_size", "pipeline_model_parallel_size", "expert_tensor_parallel_size"]
+        if name == "images":
+            restricted += ["context_parallel_size", "expert_model_parallel_size"]
+        for field in restricted:
+            if getattr(component, field) not in (None, 1):
+                raise ValueError(f"Nemotron4 MIMO conversion requires {name}.{field}=1.")
+
+    standard_provider = source_bridge.provider_bridge(hf_pretrained)
+    standard_provider.params_dtype = source_bridge.dtype_from_hf(hf_pretrained.config, default=torch.float32)
+    standard_provider.bf16 = standard_provider.params_dtype == torch.bfloat16
+    standard_provider.fp16 = standard_provider.params_dtype == torch.float16
+    provider = MegatronMIMOProvider.from_standard_provider(standard_provider, parallelism_config)
+    provider.freeze_language_model = standard_provider.freeze_language_model
+    provider.freeze_modality_encoders = {"images": standard_provider.freeze_vision_model}
+    provider.freeze_modality_projections = {"images": standard_provider.freeze_vision_projection}
+    routes = [
+        MIMOComponent("language", "language_model.", "language_model"),
+        MIMOComponent("images", "vision_model.", "modality_submodules.images.encoders.pixtral"),
+        MIMOComponent(
+            "projector",
+            "vision_projection.",
+            "modality_submodules.images.input_projections.0",
+            component_name="images",
+        ),
+    ]
+    return provider, routes

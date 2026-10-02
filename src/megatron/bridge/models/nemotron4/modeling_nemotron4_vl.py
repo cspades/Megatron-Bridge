@@ -30,7 +30,10 @@ wide-residual, GDP and shortcut-MoE layers it needs are not in upstream MCore;
 the provider is responsible for supplying an MCore that has them.
 """
 
+from typing import Callable, Self
+
 import torch
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.models.vision.vit_model import ViTModel
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -44,6 +47,35 @@ from megatron.bridge.models.nemotron_omni.modeling_nemotron_omni import (
     _ignore_transformer_engine_extra_state,
     _project_multimodal_embeddings,
 )
+
+
+class Nemotron4MIMOLanguageModel(HybridModel):
+    """Hybrid decoder retaining Nemotron4's FP32 state during MIMO dtype casts.
+
+    MIMO calls ``bfloat16()`` on the complete model. The residual controllers,
+    GDP decay parameters, and router bookkeeping must keep their original FP32
+    values, just as the HF model's strict FP32 module list requires.
+    """
+
+    def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True) -> Self:
+        retained = []
+        for name, tensor in list(self.named_parameters()) + list(self.named_buffers()):
+            if (
+                getattr(tensor, "is_residual_map_parameter", False)
+                or getattr(tensor, "is_wide_residual_retention_parameter", False)
+                or name.endswith((".A_log", ".expert_bias", ".qb_bin_bounds"))
+            ):
+                grad = tensor.grad.detach() if tensor.grad is not None else None
+                retained.append((name, isinstance(tensor, torch.nn.Parameter), tensor.detach(), grad))
+        super()._apply(fn, recurse=recurse)
+        # Keep parameter objects and their parallelism/optimizer attributes. A
+        # detached reference retains the original storage across Module._apply.
+        for name, is_parameter, original, original_grad in retained:
+            tensor = self.get_parameter(name) if is_parameter else self.get_buffer(name)
+            tensor.data = original.to(device=tensor.device, dtype=torch.float32)
+            if original_grad is not None:
+                tensor.grad.data = original_grad.to(device=tensor.device, dtype=torch.float32)
+        return self
 
 
 class Nemotron4VLModel(NemotronOmniModel):
