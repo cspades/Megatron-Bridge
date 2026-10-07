@@ -60,13 +60,26 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class MIMOComponent:
-    """One MIMO component route in the source bridge mapping registry."""
+    """One conversion route, optionally sharing another component's parallelism.
+
+    ``name`` uniquely identifies the route and its cached conversion tasks.
+    ``component_name`` selects its process groups and defaults to ``name``.
+    Encoder and projector routes can therefore share one modality's rank grid.
+    """
 
     name: str
     source_prefix: str
     target_module_path: str
+    component_name: str | None = None
+
+    @property
+    def parallelism_name(self) -> str:
+        """Return the component that owns this route's tensors."""
+        return self.name if self.component_name is None else self.component_name
 
     def __post_init__(self) -> None:
+        if self.component_name == "":
+            raise ValueError("MIMOComponent.component_name must be non-empty when supplied")
         if not self.name:
             raise ValueError("MIMOComponent.name must be a non-empty string")
         if not self.source_prefix:
@@ -94,13 +107,13 @@ def validate_route_table(
     if duplicates:
         raise ValueError(f"Duplicate route names: {duplicates}")
 
-    declared_names = set(names)
+    declared_names = {route.parallelism_name for route in routes}
     config_names = set(parallelism_config.module_parallelisms.keys())
 
     extra_routes = sorted(declared_names - config_names)
     if extra_routes:
         raise ValueError(
-            "Route names not present in parallelism_config.module_parallelisms: "
+            "Components owning conversion routes are not present in parallelism_config.module_parallelisms: "
             f"{extra_routes}. Available: {sorted(config_names)}"
         )
 
@@ -108,7 +121,7 @@ def validate_route_table(
     if missing_routes:
         raise ValueError(
             "parallelism_config.module_parallelisms entries without a route: "
-            f"{missing_routes}. Declared routes: {sorted(declared_names)}"
+            f"{missing_routes}. Components owning routes: {sorted(declared_names)}"
         )
 
     if modality_submodules_spec is not None:
@@ -119,11 +132,11 @@ def validate_route_table(
         missing_vs_modality = sorted(expected_names - declared_names)
         if extra_vs_modality or missing_vs_modality:
             raise ValueError(
-                "Route names do not align with modality_submodules_spec keys + "
-                f"{{{MIMO_LANGUAGE_MODULE_KEY!r}}}. Routes: {sorted(declared_names)}; "
+                "Components owning conversion routes do not align with modality_submodules_spec keys + "
+                f"{{{MIMO_LANGUAGE_MODULE_KEY!r}}}. Route owners: {sorted(declared_names)}; "
                 f"expected: {sorted(expected_names)}. "
-                f"Extra in routes: {extra_vs_modality}; missing from routes: {missing_vs_modality}. "
-                "Route names, modality keys, and parallelism-config component keys must match."
+                f"Unexpected component owners: {extra_vs_modality}; components without routes: {missing_vs_modality}. "
+                "Each route must reference a configured component; multiple routes may share that component."
             )
 
     _check_no_prefix_overlap(routes)
@@ -798,19 +811,20 @@ def _iter_active_routes(
 ) -> Iterator[tuple[MIMOComponent, Any]]:
     """Yield (route, pg_collection) pairs for components this rank owns.
 
-    Skips any route whose ``pg_collections.get(route.name)`` is ``None``.
-    Raises if a route name is missing from ``pg_collections`` entirely — that
+    Skips any route whose component's process groups are ``None``.
+    Raises if a component name is missing from ``pg_collections`` entirely — that
     means the MIMO infra was built with a different component set than the
     route table declares.
     """
     for route in routes:
-        if route.name not in pg_collections:
+        if route.parallelism_name not in pg_collections:
             raise KeyError(
-                f"Route {route.name!r} is not present in MegatronMIMOInfra.pg_collections "
+                f"Component {route.parallelism_name!r} owning route {route.name!r} "
+                "is not present in MegatronMIMOInfra.pg_collections "
                 f"(available: {sorted(pg_collections.keys())}). Route table and parallelism "
                 f"config are out of sync."
             )
-        pg_collection = pg_collections[route.name]
+        pg_collection = pg_collections[route.parallelism_name]
         if pg_collection is None:
             logger.debug("Skipping route %r on this rank: pg_collection is None", route.name)
             continue
@@ -1035,13 +1049,14 @@ def _stream_mimo_weights_to_rank0(
     world_size = dist.get_world_size()
 
     for route in routes:
-        if route.name not in pg_collections:
+        if route.parallelism_name not in pg_collections:
             raise ValueError(
-                f"Route {route.name!r} is not present in MegatronMIMOInfra.pg_collections "
+                f"Component {route.parallelism_name!r} owning route {route.name!r} "
+                "is not present in MegatronMIMOInfra.pg_collections "
                 f"(available: {sorted(pg_collections.keys())})."
             )
 
-        pg_collection = pg_collections[route.name]
+        pg_collection = pg_collections[route.parallelism_name]
         is_active = pg_collection is not None
         is_representative = is_active and _is_component_export_representative(pg_collection)
         route_iter = None
