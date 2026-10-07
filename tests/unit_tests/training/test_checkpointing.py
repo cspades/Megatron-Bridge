@@ -2377,6 +2377,7 @@ class TestLoadCheckpoint:
 
         # Mock dist_checkpointing
         mock_dist_ckpt.load_content_metadata.return_value = {}
+        mock_dist_ckpt.load_tensors_metadata.return_value = {}
         mock_dist_ckpt.load.return_value = {}
 
         # Mock rerun state machine
@@ -2425,6 +2426,10 @@ class TestLoadCheckpoint:
         assert result[0] == 1000  # iteration
         assert result[1] == 500000  # FLOPs
         mock_set_version.assert_called_with(3.0)
+        optimizer_metadata = mock_generate_state_dict.call_args.kwargs["optim_sd_kwargs"]["metadata"]
+        assert optimizer_metadata["checkpoint_version"] == 3.0
+        assert optimizer_metadata["legacy_grad_dtypes"] == {}
+        mock_dist_ckpt.load_tensors_metadata.assert_called_once_with("/ckpt/path")
         # Verify that train_state.pt was read (not megatron-lm fallback)
         mock_read_state.assert_called_once()
 
@@ -4581,7 +4586,7 @@ class TestFSDPDTensorFunctionality:
             # Should use state_dict_for_save_checkpoint for fsdp_dtensor
             mock_model.state_dict_for_save_checkpoint.assert_called_once()
             assert "model" in result
-            assert result["checkpoint_version"] == 3.0
+            assert result["checkpoint_version"] == 3.1
 
     @patch("megatron.bridge.training.checkpointing.HAVE_MEGATRON_FSDP", True)
     def test_preprocess_fsdp_dtensor_state_dict(self):

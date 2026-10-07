@@ -51,6 +51,7 @@ from megatron.core.dist_checkpointing.utils import _clean_metadata_for_serializa
 from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer, MegatronOptimizer
+from megatron.core.optimizer.distrib_optimizer import get_legacy_grad_dtypes
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
@@ -256,7 +257,10 @@ def set_checkpoint_version(value: float) -> None:
     """
     global _CHECKPOINT_VERSION
     if _CHECKPOINT_VERSION is not None:
-        assert _CHECKPOINT_VERSION == value, "checkpoint versions do not match"
+        # Minor versions can change non-model state (for example optimizer key spelling)
+        # without changing the model-weight layout governed by this global.
+        versions_match = value is not None and int(_CHECKPOINT_VERSION) == int(value)
+        assert versions_match, f"checkpoint versions do not match: {_CHECKPOINT_VERSION} vs {value}"
     _CHECKPOINT_VERSION = value
 
 
@@ -2133,7 +2137,7 @@ def generate_state_dict(
     """
     # Arguments, iteration, and model.
     state_dict = {}
-    state_dict["checkpoint_version"] = 3.0
+    state_dict["checkpoint_version"] = 3.1
     if iteration is not None:
         state_dict["iteration"] = iteration
 
@@ -2987,6 +2991,15 @@ def _load_checkpoint_from_path(
         if sharded_sd_metadata is None:
             sharded_sd_metadata = {}
         sharded_sd_metadata["dp_cp_group"] = pg_collection.dp_cp
+        # Optimizer load templates use the content version to select checkpoint-era FQNs.
+        sharded_sd_metadata["checkpoint_version"] = state_dict.get("checkpoint_version", 0)
+        if gen_sd_optim is not None and (sharded_sd_metadata["checkpoint_version"] or 0) < 3.1:
+            # Pre-3.1 optimizer FQNs include the saving run's (param dtype, grad dtype)
+            # tuple. Recover its grad dtypes so loading also works when the current run
+            # uses a different main-grad dtype.
+            sharded_sd_metadata["legacy_grad_dtypes"] = get_legacy_grad_dtypes(
+                dist_checkpointing.load_tensors_metadata(checkpoint_name).keys()
+            )
         optim_sd_kwargs = dict(metadata=sharded_sd_metadata, is_loading=True)
         model_sd_kwargs = dict(metadata=sharded_sd_metadata)
 
@@ -3068,6 +3081,8 @@ def _load_checkpoint_from_path(
             metadata=_build_sharded_state_dict_metadata(cfg.optimizer.use_distributed_optimizer, cfg.checkpoint),
             is_loading=True,
         )
+        # Keep optimizer loading metadata consistent with the torch_dist path.
+        optim_sd_kwargs["metadata"]["checkpoint_version"] = state_dict.get("checkpoint_version") or 0
 
         state_dict = generate_state_dict(
             cfg.checkpoint,
