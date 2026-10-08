@@ -28,25 +28,39 @@ for them explicitly, because a dataclass subclass would otherwise accept these
 settings as new, silently ignored fields on an MCore that lacks them.
 """
 
+import argparse
 import copy
 import dataclasses
+import os
+import tempfile
 from dataclasses import dataclass, field
-from typing import Any, Callable, ClassVar
+from functools import partial
+from pathlib import Path
+from typing import Any, Callable, ClassVar, Literal
 
 import torch
-from megatron.core import parallel_state
+from megatron.core import dist_checkpointing
 from megatron.core.activations import squared_relu
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TERowParallelLinear
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
 from megatron.core.models.vision.vit_model import ViTModel
+from megatron.core.pipeline_parallel.utils import is_pp_first_stage
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
 from megatron.core.transformer.mlp import MLPSubmodules
-from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.core.transformer.transformer_config import TransformerConfig as MCoreTransformerConfig
 
 from megatron.bridge.models.hybrid.hybrid_provider import HybridModelProvider
-from megatron.bridge.models.nemotron4.modeling_nemotron4_vl import Nemotron4MIMOLanguageModel, Nemotron4VLModel
+from megatron.bridge.models.nemotron4.modeling_nemotron4_vl import (
+    Nemotron4GatedDeltaProductMixer,
+    Nemotron4MIMOLanguageModel,
+    Nemotron4VisionMLP,
+    Nemotron4VLModel,
+)
+from megatron.bridge.training.mlm_compat.arguments import _transformer_config_from_args
 
 
 # Nano/WSM: 32 GDP ("M"), 4 dense MLP ("-"), 8 attention ("*"), 28 MoE ("E"), then two MTP depths.
@@ -134,6 +148,82 @@ def nemotron4_projector_gelu(x: torch.Tensor) -> torch.Tensor:
     round differently.
     """
     return 0.5 * x * (1.0 + torch.tanh(x * 0.7978845608 * (1.0 + 0.044715 * x * x)))
+
+
+PRECISION_RECIPE_FILENAME = "precision_recipe.yaml"
+
+# Runtime parallel sizes come from the provider (NeMo RL copies policy.megatron_cfg onto
+# it), never from a native checkpoint's saved arguments.
+_CHECKPOINT_PARALLEL_FIELDS = frozenset(
+    {
+        "tensor_model_parallel_size",
+        "pipeline_model_parallel_size",
+        "context_parallel_size",
+        "expert_model_parallel_size",
+        "expert_tensor_parallel_size",
+        "sequence_parallel",
+        "tensor_parallel_num_weight_shards",
+        "expert_tensor_parallel_num_weight_shards",
+        "gtp_weight_remat_size",
+        "expert_gtp_weight_remat_size",
+    }
+)
+
+_TORCH_DTYPES = {str(dtype): dtype for dtype in (torch.float32, torch.float16, torch.bfloat16)}
+
+# Mistral-ViT geometries the Nemotron4 Megatron-LM fork selects by ``--mistral-vit-model-size``:
+# (num_layers, hidden_size, ffn_hidden_size, kv_channels). Both use 16 heads.
+_MISTRAL_VIT_GEOMETRY = {
+    "410m": (24, 1024, 4096, 64),
+    "1.6b": (30, 2048, 6144, 128),
+}
+
+
+def _dict_from_namespace(args: argparse.Namespace) -> dict[str, Any]:
+    """YAML-safe copy of native checkpoint args, for run_config serialization."""
+    from megatron.bridge.training.utils.config_utils import _ConfigContainerBase
+
+    serialized: dict[str, Any] = {}
+    for key, value in vars(args).items():
+        if key.startswith("_"):
+            continue
+        if isinstance(value, torch.dtype):
+            serialized[key] = str(value)
+            continue
+        try:
+            serialized[key] = _ConfigContainerBase._convert_value_to_dict(value)
+        except Exception:
+            continue
+    return serialized
+
+
+def _namespace_from_dict(saved_args: dict[str, Any]) -> argparse.Namespace:
+    """Rebuild the native args Namespace from a previously serialized mapping."""
+    from megatron.bridge.utils.instantiate_utils import instantiate
+
+    restored: dict[str, Any] = {}
+    for key, value in saved_args.items():
+        if isinstance(value, str) and value in _TORCH_DTYPES:
+            restored[key] = _TORCH_DTYPES[value]
+        elif isinstance(value, dict) and "_target_" in value:
+            restored[key] = instantiate(value)
+        else:
+            restored[key] = value
+    return argparse.Namespace(**restored)
+
+
+def _validate_native_args(args: argparse.Namespace) -> None:
+    """Reject native checkpoints this non-MIMO model cannot represent."""
+    if getattr(args, "vlm_checkpoint_layout", None) != "llava":
+        raise ValueError(
+            "Expected a native non-MIMO (LLaVA-layout) Nemotron4 checkpoint; "
+            f"got vlm_checkpoint_layout={getattr(args, 'vlm_checkpoint_layout', None)!r}"
+        )
+    if getattr(args, "vision_projection_type", None) != "mlp2":
+        raise ValueError("Expected the Nemotron4 mlp2 projector")
+    model_size = getattr(args, "mistral_vit_model_size", "410m")
+    if model_size not in _MISTRAL_VIT_GEOMETRY:
+        raise ValueError(f"Unsupported Mistral-ViT model size in checkpoint args: {model_size!r}")
 
 
 @dataclass
@@ -233,9 +323,35 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
     # ``None`` means "the language hidden size", which is what Nemotron4 uses.
     vision_projection_ffn_hidden_size: int | None = None
 
-    freeze_language_model: bool = False
-    freeze_vision_model: bool = False
-    freeze_vision_projection: bool = False
+    # ``None`` means "not requested"; a native checkpoint's freeze_lm/freeze_vit/
+    # freeze_projection fill it in when hydrating from saved args.
+    freeze_language_model: bool | None = None
+    freeze_vision_model: bool | None = None
+    freeze_vision_projection: bool | None = None
+
+    # --- training runtime controls (NeMo RL sets these through policy.megatron_cfg) ---
+    # The Bridge TransformerConfig marks these init=False and derives them from the
+    # weight-shard counts. Expose them so YAML / model_overrides can request GTP directly;
+    # shards = TP * GTP is derived in _apply_gtp_weight_shards().
+    gtp_weight_remat_size: int = 1
+    expert_gtp_weight_remat_size: int = 1
+    vision_dp_over_cp: bool = True
+    """Encode whole images on separate language CP ranks, then gather features."""
+    recompute_vision: bool = False
+    vision_recompute_granularity: Literal["full", "selective"] | None = None
+    vision_recompute_method: Literal["uniform", "block"] | None = None
+    vision_recompute_num_layers: int | None = None
+
+    # --- legacy native-checkpoint hydration (non-MIMO checkpoints converted from the fork) ---
+    checkpoint_path: str = ""
+    """Native checkpoint whose common args describe the architecture. Empty for HF-derived providers."""
+    precision_recipe_path: str = ""
+    precision_recipe_yaml: str | None = None
+    """Raw TE precision recipe YAML; saved into run_config and copied next to it so resume
+    does not need the original checkpoint directory."""
+    saved_args: dict[str, Any] | None = None
+    """Serialized native argparse payload; present on resume so architecture can be
+    reconstructed without the original checkpoint."""
 
     @property
     def special_token_ids(self) -> dict[str, int]:
@@ -359,21 +475,225 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
         _make_replicated_single_stage(projection_cfg)
         return projection_cfg
 
+    # ------------------------------------------------------------------ runtime controls
+    def _apply_vision_recompute_settings(self, vision_config: Any) -> None:
+        """Apply explicitly requested activation recompute to the ViT tower."""
+        if not self.recompute_vision:
+            vision_config.recompute_granularity = None
+            vision_config.recompute_method = None
+            vision_config.recompute_num_layers = None
+            return
+        recompute_settings = (
+            self.vision_recompute_granularity,
+            self.vision_recompute_method,
+            self.vision_recompute_num_layers,
+        )
+        if any(value is None for value in recompute_settings):
+            raise ValueError(
+                "Vision recompute requires vision_recompute_granularity, "
+                "vision_recompute_method, and vision_recompute_num_layers."
+            )
+        vision_config.recompute_granularity = self.vision_recompute_granularity
+        vision_config.recompute_method = self.vision_recompute_method
+        vision_config.recompute_num_layers = self.vision_recompute_num_layers
+
+    def _apply_gtp_weight_shards(self) -> None:
+        if self.gtp_weight_remat_size < 1 or self.expert_gtp_weight_remat_size < 1:
+            raise ValueError("gtp_weight_remat_size and expert_gtp_weight_remat_size must be >= 1")
+        if self.expert_tensor_parallel_size is None and self.expert_model_parallel_size > 1:
+            self.expert_tensor_parallel_size = 1
+        self.tensor_parallel_num_weight_shards = self.tensor_model_parallel_size * self.gtp_weight_remat_size
+        self.expert_tensor_parallel_num_weight_shards = (
+            self.expert_tensor_parallel_size or 1
+        ) * self.expert_gtp_weight_remat_size
+
+    # ------------------------------------------------------------------ precision recipe
+    def _load_precision_recipe_yaml(self) -> None:
+        if self.precision_recipe_yaml:
+            return
+        if self.precision_recipe_path and os.path.isfile(self.precision_recipe_path):
+            self.precision_recipe_yaml = Path(self.precision_recipe_path).read_text()
+
+    def _materialize_precision_recipe(self) -> str:
+        """Return a readable recipe file, writing one from saved YAML if needed."""
+        self._load_precision_recipe_yaml()
+        if self.precision_recipe_path and os.path.isfile(self.precision_recipe_path):
+            return self.precision_recipe_path
+        if not self.precision_recipe_yaml:
+            raise ValueError("precision_recipe_path is required")
+        handle = tempfile.NamedTemporaryFile(prefix="nemotron4_precision_recipe_", suffix=".yaml", delete=False)
+        with handle:
+            handle.write(self.precision_recipe_yaml.encode())
+        self.precision_recipe_path = handle.name
+        return self.precision_recipe_path
+
+    def save_precision_recipe_assets(self, checkpoint_dir: str) -> None:
+        """Copy the TE precision recipe next to run_config.yaml (called by save_checkpoint)."""
+        self._load_precision_recipe_yaml()
+        if not self.precision_recipe_yaml:
+            return
+        Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+        Path(checkpoint_dir, PRECISION_RECIPE_FILENAME).write_text(self.precision_recipe_yaml)
+
+    # ------------------------------------------------------------------ native-checkpoint hydration
+    def _apply_checkpoint_freeze_settings(self, args: argparse.Namespace) -> None:
+        if self.freeze_language_model is None:
+            self.freeze_language_model = bool(getattr(args, "freeze_lm", False))
+        if self.freeze_vision_model is None:
+            self.freeze_vision_model = bool(getattr(args, "freeze_vit", False))
+        if self.freeze_vision_projection is None:
+            self.freeze_vision_projection = bool(getattr(args, "freeze_projection", False))
+
+    def _hydrate_from_native_args(self, args: argparse.Namespace) -> None:
+        """Copy the architecture of a native Nemotron4 checkpoint onto this provider."""
+        config = _transformer_config_from_args(args)
+        for item in dataclasses.fields(config):
+            if item.name in _CHECKPOINT_PARALLEL_FIELDS or not hasattr(self, item.name):
+                continue
+            setattr(self, item.name, getattr(config, item.name))
+        self.hybrid_layer_pattern = args.hybrid_layer_pattern
+        self.hybrid_override_pattern = None
+        self.mtp_hybrid_override_pattern = None
+        self.mtp_use_repeated_layer = args.mtp_use_repeated_layer
+        self.seq_length = args.seq_length
+        self.vocab_size = args.padded_vocab_size
+        self.should_pad_vocab = False
+        self.position_embedding_type = "none"
+        self.share_embeddings_and_output_weights = False
+        self.logit_dtype = args.logit_dtype
+        # Vision tower and projector.
+        num_layers, hidden, ffn, kv = _MISTRAL_VIT_GEOMETRY[getattr(args, "mistral_vit_model_size", "410m")]
+        self.vision_num_layers = num_layers
+        self.vision_hidden_size = hidden
+        self.vision_ffn_hidden_size = ffn
+        self.vision_kv_channels = kv
+        self.vision_num_attention_heads = 16
+        self.vision_projection_ffn_hidden_size = None
+        self.image_token_index = args.image_token_id
+        self.img_h = args.img_h
+        self.img_w = args.img_w
+        self.patch_dim = args.patch_dim
+        self.spatial_merge_size = args.spatial_merge_size
+
+    def __post_init__(self) -> None:
+        already_loaded = getattr(self, "_saved_args", None) is not None
+        if already_loaded:
+            # NeMo RL calls this again after applying megatron_cfg TP/ETP.
+            self._apply_gtp_weight_shards()
+        super().__post_init__()
+        if already_loaded:
+            return
+        self._saved_args = None
+        if self.saved_args is not None:
+            # Resume: run_config already carries the hydrated architecture fields.
+            args = _namespace_from_dict(self.saved_args)
+            _validate_native_args(args)
+            if self.precision_recipe_path or self.precision_recipe_yaml:
+                args.te_precision_config_file = self._materialize_precision_recipe()
+            self._saved_args = args
+            self._apply_checkpoint_freeze_settings(args)
+            self._apply_gtp_weight_shards()
+            return
+        if not self.checkpoint_path:
+            # HF-derived or explicitly configured provider: nothing to hydrate.
+            return
+        if not (self.precision_recipe_path or self.precision_recipe_yaml):
+            raise ValueError("checkpoint_path requires precision_recipe_path or precision_recipe_yaml")
+        args = copy.deepcopy(dist_checkpointing.load_common_state_dict(self.checkpoint_path)["args"])
+        _validate_native_args(args)
+        args.te_precision_config_file = self._materialize_precision_recipe()
+        self._saved_args = args
+        self.saved_args = _dict_from_namespace(args)
+        self._hydrate_from_native_args(args)
+        self._apply_checkpoint_freeze_settings(args)
+        self._apply_gtp_weight_shards()
+
+    def finalize(self) -> None:
+        """Check MCore support, reconcile hybrid/MTP fields, then derive GTP from TP/GTP."""
+        requested_gtp = self.gtp_weight_remat_size
+        requested_expert_gtp = self.expert_gtp_weight_remat_size
+        self._apply_gtp_weight_shards()
+        super().finalize()
+        if self.gtp_weight_remat_size != requested_gtp or self.expert_gtp_weight_remat_size != requested_expert_gtp:
+            raise ValueError(
+                "GTP shard reconciliation did not honor the provider config: "
+                f"got gtp_weight_remat_size={self.gtp_weight_remat_size}, "
+                f"expert_gtp_weight_remat_size={self.expert_gtp_weight_remat_size}, "
+                f"requested {requested_gtp} and {requested_expert_gtp}"
+            )
+
+    def to_cfg_dict(self) -> dict:
+        """Serialize hydrated architecture, runtime parallel sizes, and native args."""
+        from megatron.bridge.training.utils.config_utils import _ConfigContainerBase
+
+        if getattr(self, "_saved_args", None) is not None:
+            self.saved_args = _dict_from_namespace(self._saved_args)
+        self._load_precision_recipe_yaml()
+        result = {"_target_": f"{type(self).__module__}.{type(self).__qualname__}"}
+        for item in dataclasses.fields(self):
+            if item.name.startswith("_"):
+                continue
+            result[item.name] = _ConfigContainerBase._convert_value_to_dict(getattr(self, item.name))
+        if self.precision_recipe_yaml:
+            result["precision_recipe_path"] = PRECISION_RECIPE_FILENAME
+        return result
+
+    # ------------------------------------------------------------------ model construction
+    def _language_layer_spec(self) -> ModuleSpec:
+        """Hybrid stack spec with the stride-safe GDP mixer substituted."""
+        saved_args = getattr(self, "_saved_args", None)
+        if saved_args is not None and getattr(saved_args, "spec", None):
+            # Native checkpoints name their own layer spec; honor it exactly.
+            spec = copy.deepcopy(import_module(saved_args.spec))
+        else:
+            spec = copy.deepcopy(self._resolve_hybrid_stack_spec())
+        gdp_mixer_spec = spec.submodules.mamba_layer.submodules.mixer
+        if gdp_mixer_spec.module is not GatedDeltaProductMixer:
+            raise TypeError(
+                f"Nemotron4 expected its recurrent layer spec to use GatedDeltaProductMixer, got {gdp_mixer_spec.module!r}"
+            )
+        gdp_mixer_spec.module = Nemotron4GatedDeltaProductMixer
+        return spec
+
+    @staticmethod
+    def _vision_layer_spec() -> ModuleSpec:
+        """ViT layer spec whose MLP keeps GTP GLU shards contiguous."""
+        vision_layer_spec = get_vit_layer_with_transformer_engine_spec()
+        vision_mlp_spec = vision_layer_spec.submodules.mlp
+        if isinstance(vision_mlp_spec, partial):
+            vision_layer_spec.submodules.mlp = partial(
+                Nemotron4VisionMLP.as_mlp_submodule, *vision_mlp_spec.args, **vision_mlp_spec.keywords
+            )
+        elif isinstance(vision_mlp_spec, ModuleSpec):
+            vision_mlp_spec.module = Nemotron4VisionMLP
+        else:
+            raise TypeError(f"Unexpected ViT MLP spec type: {type(vision_mlp_spec)!r}")
+        return vision_layer_spec
+
     def provide(self, pre_process=None, post_process=None, vp_stage=None) -> Nemotron4VLModel:
-        """Build the Nemotron4 VLM with the encoder on the first pipeline stage."""
+        """Build the Nemotron4 VLM for the current provider parallel sizes."""
         require_nemotron4_mcore()
         language_cfg = self._copy_config_without_runtime_process_groups(deep=True)
-        vision_cfg = self._build_vision_config(language_cfg)
-        projection_cfg = self._build_vision_projection_config(language_cfg)
+        vision_cfg = _dense_config(self._build_vision_config(language_cfg))
+        projection_cfg = _dense_config(self._build_vision_projection_config(language_cfg))
+        self._apply_vision_recompute_settings(vision_cfg)
+        for config in (vision_cfg, projection_cfg):
+            # The encoder and projector stay in BF16 regardless of the decoder's FP8/MXFP8 recipe.
+            config.fp8 = None
+            config.fp8_param = False
+            config.quant_recipe = None
 
-        add_encoder = parallel_state.is_pipeline_first_stage() if self.pipeline_model_parallel_size > 1 else True
+        pg_collection = self._pg_collection
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        add_encoder = True if self.pipeline_model_parallel_size == 1 else is_pp_first_stage(pg_collection.pp)
         model = Nemotron4VLModel(
             language_transformer_config=language_cfg,
-            language_transformer_layer_spec=self._resolve_hybrid_stack_spec(),
+            language_transformer_layer_spec=self._language_layer_spec(),
             language_vocab_size=self.vocab_size,
             language_max_sequence_length=self.seq_length,
             vision_transformer_config=vision_cfg,
-            vision_transformer_layer_spec=get_vit_layer_with_transformer_engine_spec(),
+            vision_transformer_layer_spec=self._vision_layer_spec(),
             vision_projection_config=projection_cfg,
             vision_projection_layer_spec=nemotron4_projection_submodules(),
             image_token_index=self.image_token_index,
@@ -389,15 +709,15 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
             post_process=True if post_process is None else post_process,
             add_encoder=add_encoder,
             add_decoder=True,
-            pg_collection=self._pg_collection,
+            pg_collection=pg_collection,
+            vision_dp_over_cp=self.vision_dp_over_cp,
             vp_stage=vp_stage,
         )
-
         if self.freeze_language_model or self.freeze_vision_model or self.freeze_vision_projection:
             model.freeze(
-                freeze_language_model=self.freeze_language_model,
-                freeze_vision_model=self.freeze_vision_model,
-                freeze_vision_projection=self.freeze_vision_projection,
+                freeze_language_model=bool(self.freeze_language_model),
+                freeze_vision_model=bool(self.freeze_vision_model),
+                freeze_vision_projection=bool(self.freeze_vision_projection),
             )
         return model
 

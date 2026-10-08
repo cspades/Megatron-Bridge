@@ -1,5 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-"""Unit tests for the experimental NM4 LLaVA provider."""
+"""Unit tests for the Nemotron4 VL model and provider runtime controls."""
 
 from dataclasses import fields
 from types import SimpleNamespace
@@ -11,12 +11,13 @@ from megatron.core.context_parallel import ContextParallelBatch
 from megatron.core.models.multimodal import context_parallel as vision_cp
 from megatron.core.packed_seq_params import PackedSeqParams
 
-from megatron.bridge.models import experimental_nm4_llava_provider as nm4
-from megatron.bridge.models.experimental_nm4_llava_provider import ExperimentalNM4LlavaProvider, NM4LlavaModel
+from megatron.bridge.models.nemotron4 import Nemotron4VLModel, Nemotron4VLModelProvider
+from megatron.bridge.models.nemotron4 import modeling_nemotron4_vl as nm4
+from megatron.bridge.models.nemotron4 import nemotron4_provider as nm4_provider
 
 
 def _provider_with_recompute(**overrides):
-    provider = object.__new__(ExperimentalNM4LlavaProvider)
+    provider = object.__new__(Nemotron4VLModelProvider)
     values = {
         "recompute_vision": False,
         "vision_recompute_granularity": None,
@@ -24,7 +25,7 @@ def _provider_with_recompute(**overrides):
         "vision_recompute_num_layers": None,
         **overrides,
     }
-    field_names = {field.name for field in fields(ExperimentalNM4LlavaProvider)}
+    field_names = {field.name for field in fields(Nemotron4VLModelProvider)}
     for key, value in values.items():
         if key not in field_names:
             raise ValueError(f"Unknown provider field: {key}")
@@ -33,7 +34,7 @@ def _provider_with_recompute(**overrides):
 
 
 def test_provider_exposes_vision_recompute_fields():
-    field_names = {field.name for field in fields(ExperimentalNM4LlavaProvider)}
+    field_names = {field.name for field in fields(Nemotron4VLModelProvider)}
 
     assert {
         "recompute_vision",
@@ -89,7 +90,7 @@ def test_nm4_constructor_keeps_vision_cp_local(cp_size, vision_dp_over_cp, gtp_s
         patch.object(torch.distributed, "get_rank", return_value=3),
         patch.object(torch.distributed, "new_group") as new_group,
     ):
-        model = NM4LlavaModel(
+        model = Nemotron4VLModel(
             language_transformer_config=config,
             language_transformer_layer_spec=None,
             language_vocab_size=16,
@@ -154,7 +155,7 @@ class _MergedVision(torch.nn.Module):
 
 
 def _vision_model(cp_size):
-    model = object.__new__(nm4.NM4LlavaModel)
+    model = object.__new__(nm4.Nemotron4VLModel)
     torch.nn.Module.__init__(model)
     model.patch_dim = 1
     model.spatial_merge_size = 2
@@ -229,7 +230,7 @@ def test_vision_cp_rejects_mismatched_process_group():
 
 @pytest.mark.unit
 def test_provider_enables_vision_dp_over_cp_by_default():
-    defaults = {field.name: field.default for field in fields(ExperimentalNM4LlavaProvider)}
+    defaults = {field.name: field.default for field in fields(Nemotron4VLModelProvider)}
     assert defaults["vision_dp_over_cp"] is True
 
 
@@ -318,7 +319,7 @@ def test_vision_cp_nccl_handles_uneven_features_and_gradients(tmp_path):
 def test_nm4_cp_padding_mask_uses_attention_layout(
     linear_layout: str, attention_layout: str, post_process: bool
 ) -> None:
-    model = object.__new__(NM4LlavaModel)
+    model = object.__new__(Nemotron4VLModel)
     torch.nn.Module.__init__(model)
     model.pre_process = False
     model.context_parallel_lm = 2
@@ -383,15 +384,15 @@ def test_nm4_cp_padding_mask_uses_attention_layout(
 
     with (
         patch(
-            "megatron.bridge.models.experimental_nm4_llava_provider.get_batches_on_this_cp_rank",
+            "megatron.bridge.models.nemotron4.modeling_nemotron4_vl.get_batches_on_this_cp_rank",
             return_value=cp_batch,
         ) as partition,
         patch(
-            "megatron.bridge.models.experimental_nm4_llava_provider.convert_cp_layout",
+            "megatron.bridge.models.nemotron4.modeling_nemotron4_vl.convert_cp_layout",
             side_effect=lambda tensor, **kwargs: tensor.flip(0) if kwargs["source_layout"] == "contiguous" else tensor,
         ) as conversion,
     ):
-        output, returned_mask = NM4LlavaModel.forward(
+        output, returned_mask = Nemotron4VLModel.forward(
             model,
             input_ids=torch.arange(8).view(1, 8),
             padding_mask=full_padding_mask,
@@ -416,3 +417,171 @@ def test_nm4_cp_padding_mask_uses_attention_layout(
     expected_valid_tokens = boundary_valid_tokens if linear_layout == attention_layout else attention_valid_tokens
     torch.testing.assert_close(model.language_model.call_args.kwargs["padding_mask"], ~expected_valid_tokens)
     assert all("mtp_input_mask" not in batch for batch in cp_batch.batches_by_layout.values())
+
+
+# --------------------------------------------------------------------------- unification contracts
+
+
+def _merge_model():
+    model = object.__new__(Nemotron4VLModel)
+    torch.nn.Module.__init__(model)
+    model.image_token_index = 7
+    return model
+
+
+def test_media_merge_is_one_for_one_and_in_place():
+    """Omni contract: one feature per valid placeholder, replaced in place, length preserved."""
+    model = _merge_model()
+    input_ids = torch.tensor([[1, 7, 7, 2, 7]])
+    embeddings = torch.zeros(5, 1, 3)  # [S, B, H]
+    features = torch.tensor([[1.0, 1.0, 1.0], [2.0, 2.0, 2.0], [3.0, 3.0, 3.0]])
+    merged = model._merge_projected_media(embeddings, input_ids, features, None)
+    assert merged.shape == embeddings.shape
+    torch.testing.assert_close(merged[[1, 2, 4], 0], features)
+    torch.testing.assert_close(merged[[0, 3], 0], torch.zeros(2, 3))
+    assert embeddings.abs().sum() == 0, "merge must not mutate the caller's embeddings"
+
+
+def test_media_merge_rejects_count_mismatch():
+    model = _merge_model()
+    input_ids = torch.tensor([[7, 7]])
+    with pytest.raises(ValueError, match="one placeholder for every projected patch"):
+        model._merge_projected_media(torch.zeros(2, 1, 3), input_ids, torch.ones(1, 3), None)
+
+
+def test_media_merge_validity_mask_filters_placeholders():
+    model = _merge_model()
+    input_ids = torch.tensor([[7, 7, 7]])
+    validity = torch.tensor([[True, False, True]])
+    merged = model._merge_projected_media(torch.zeros(3, 1, 2), input_ids, torch.ones(2, 2), validity)
+    torch.testing.assert_close(merged[:, 0], torch.tensor([[1.0, 1.0], [0.0, 0.0], [1.0, 1.0]]))
+    with pytest.raises(ValueError, match="same shape as input_ids"):
+        model._merge_projected_media(torch.zeros(3, 1, 2), input_ids, torch.ones(2, 2), torch.tensor([True]))
+
+
+def test_forward_derives_validity_from_padding_then_attention_mask():
+    """Precedence: explicit mask > ~padding_mask > 2-D attention mask; 4-D masks are ignored."""
+    model = _merge_model()
+    model.pre_process = True
+    model.context_parallel_lm = 1
+    model.sequence_parallel_lm = False
+    model.config = SimpleNamespace(mtp_num_layers=0)
+    seen = {}
+
+    def embedding(input_ids, position_ids):
+        seen["text_ids"] = input_ids.clone()
+        return torch.zeros(input_ids.shape[1], 1, 2)
+
+    model.language_model = MagicMock(return_value=torch.zeros(1, 3, 2))
+    model.language_model.embedding = embedding
+    model._encode_images = MagicMock(return_value=torch.ones(1, 2))
+    input_ids = torch.tensor([[7, 7, 9]])
+    images = torch.ones(1, 4)
+
+    # Padding mask: the second placeholder is padding -> only one feature consumed.
+    Nemotron4VLModel.forward(model, input_ids, images=images, padding_mask=torch.tensor([[False, True, False]]))
+    torch.testing.assert_close(seen["text_ids"], torch.tensor([[0, 7, 9]]))
+    # 2-D attention mask acts as validity when no padding mask is present.
+    Nemotron4VLModel.forward(model, input_ids, images=images, attention_mask=torch.tensor([[True, False, True]]))
+    torch.testing.assert_close(seen["text_ids"], torch.tensor([[0, 7, 9]]))
+    # 4-D causal mask is not a validity mask: both placeholders count -> count mismatch.
+    with pytest.raises(ValueError, match="media alignment failed"):
+        Nemotron4VLModel.forward(
+            model, input_ids, images=images, attention_mask=torch.ones(1, 1, 3, 3, dtype=torch.bool)
+        )
+
+
+# Every key the NM4 SFT recipes set through policy.megatron_cfg / model_overrides. NeMo RL copies
+# these onto the provider with a hasattr guard and raises on any miss.
+RECIPE_PROVIDER_FIELDS = (
+    "gtp_weight_remat_size",
+    "expert_gtp_weight_remat_size",
+    "vision_dp_over_cp",
+    "recompute_vision",
+    "vision_recompute_granularity",
+    "vision_recompute_method",
+    "vision_recompute_num_layers",
+    "freeze_language_model",
+    "freeze_vision_model",
+    "freeze_vision_projection",
+    "mtp_num_layers",
+    "mtp_use_repeated_layer",
+    "mtp_hsm",
+    "fp8",
+    "fp8_recipe",
+    "fp8_param",
+    "quant_recipe",
+    "moe_router_load_balancing_type",
+    "moe_router_score_function",
+    "moe_router_topk",
+    "moe_router_topk_scaling_factor",
+    "moe_router_quantile_balancing_estimation_scope",
+    "moe_router_dtype",
+    "moe_router_fusion",
+    "moe_router_bias_update_rate",
+    "moe_router_pre_softmax",
+    "moe_router_enable_expert_bias",
+    "precision_recipe_path",
+    "precision_recipe_yaml",
+    "saved_args",
+    "checkpoint_path",
+)
+
+
+def test_provider_exposes_every_recipe_field():
+    names = {field.name for field in fields(Nemotron4VLModelProvider)}
+    missing = [name for name in RECIPE_PROVIDER_FIELDS if name not in names]
+    assert not missing, missing
+    # GTP sizes must be constructor arguments here even though the Bridge base marks them init=False.
+    by_name = {field.name: field for field in fields(Nemotron4VLModelProvider)}
+    assert by_name["gtp_weight_remat_size"].init and by_name["expert_gtp_weight_remat_size"].init
+
+
+def test_saved_args_resume_fills_freeze_and_materializes_recipe(tmp_path):
+    saved_args = {
+        "vlm_checkpoint_layout": "llava",
+        "vision_projection_type": "mlp2",
+        "mistral_vit_model_size": "1.6b",
+        "freeze_lm": False,
+        "freeze_vit": True,
+        "freeze_projection": False,
+        "logit_dtype": "torch.float32",
+    }
+    provider = Nemotron4VLModelProvider(
+        hidden_size=64,
+        ffn_hidden_size=128,
+        num_attention_heads=4,
+        kv_channels=16,
+        vocab_size=64,
+        hybrid_layer_pattern="M-*E",
+        mtp_num_layers=None,
+        mtp_hsm=False,
+        mtp_use_repeated_layer=False,
+        saved_args=saved_args,
+        precision_recipe_yaml="configs: {}\nmatchers: {}\n",
+        gtp_weight_remat_size=2,
+    )
+    assert provider.freeze_vision_model is True and provider.freeze_language_model is False
+    assert provider._saved_args.logit_dtype is torch.float32
+    assert provider._saved_args.te_precision_config_file.endswith(".yaml")
+    assert provider.tensor_parallel_num_weight_shards == 2
+    serialized = provider.to_cfg_dict()
+    assert serialized["_target_"].endswith("Nemotron4VLModelProvider")
+    assert serialized["precision_recipe_path"] == "precision_recipe.yaml"
+    assert serialized["saved_args"]["freeze_vit"] is True
+    provider.save_precision_recipe_assets(str(tmp_path))
+    assert (tmp_path / "precision_recipe.yaml").read_text().startswith("configs:")
+
+
+def test_native_args_validation_rejects_mimo_layout():
+    with pytest.raises(ValueError, match="non-MIMO"):
+        nm4_provider._validate_native_args(
+            SimpleNamespace(vlm_checkpoint_layout="mimo", vision_projection_type="mlp2")
+        )
+
+
+def test_legacy_alias_resolves_to_unified_classes():
+    from megatron.bridge.models import experimental_nm4_llava_provider as legacy
+
+    assert legacy.NM4LlavaModel is Nemotron4VLModel
+    assert issubclass(legacy.ExperimentalNM4LlavaProvider, Nemotron4VLModelProvider)
