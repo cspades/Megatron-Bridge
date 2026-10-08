@@ -684,7 +684,14 @@ def save_megatron_model(
         try:
             tokenizer = build_tokenizer(tokenizer_config)
             checkpoint_name = get_checkpoint_name(str(path), 0, release=False)
-            save_tokenizer_assets(tokenizer, tokenizer_config, checkpoint_name, raise_on_error=True)
+            try:
+                save_tokenizer_assets(tokenizer, tokenizer_config, checkpoint_name, raise_on_error=True)
+            except TypeError as type_error:
+                if "raise_on_error" not in str(type_error):
+                    raise
+                # Older Megatron-LM (e.g. the Nemotron4 fork) predates the raise_on_error
+                # keyword; its save_tokenizer_assets raises on failure unconditionally.
+                save_tokenizer_assets(tokenizer, tokenizer_config, checkpoint_name)
         except Exception as error:
             tokenizer_error = error
 
