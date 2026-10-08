@@ -50,6 +50,22 @@ _GTP_REMAT_PROCESS_GROUP_ALIASES = (
     "tp_ep_pp_with_egtp_remat",
 )
 
+# Weight-rematerialization axes themselves. MIMO grids have no GTP dimension, so every module
+# runs at GTP=1 and these are per-rank singleton groups.
+_GTP_REMAT_AXIS_GROUPS = ("gtp_remat", "expt_gtp_remat")
+
+
+def _get_gtp_remat_axis_group_kwargs(
+    singleton_group: torch.distributed.ProcessGroup,
+) -> Dict[str, torch.distributed.ProcessGroup]:
+    """Return size-one GTP/EGTP axis groups when the installed MCore declares them.
+
+    Newer Megatron-Core asserts that hybrid models with hierarchical MTP (``mtp_hsm``)
+    receive explicit ``gtp_remat`` groups instead of falling back to the MPU state.
+    """
+    declared_fields = ProcessGroupCollection.__dataclass_fields__
+    return {name: singleton_group for name in _GTP_REMAT_AXIS_GROUPS if name in declared_fields}
+
 
 def _get_gtp_remat_process_group_kwargs(
     dp_cp_group: torch.distributed.ProcessGroup,
@@ -306,6 +322,10 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
         Returns None for modules this rank doesn't participate in.
         """
         pg_collections: Dict[str, Optional[ProcessGroupCollection]] = {}
+        # One per-rank singleton group serves every module's GTP/EGTP axis (always size 1 here).
+        # Created lazily, only on ranks that build a collection, so grid-only callers and
+        # tests without a default process group are unaffected.
+        gtp_axis_process_groups: Dict[str, torch.distributed.ProcessGroup] = {}
 
         for module_name, grid in grids.items():
             pp_group = grid.get_pg(["pp"])
@@ -316,6 +336,11 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
 
             # Only build a full PG collection for ranks that participate in this module.
             if grid.is_current_rank_in_grid():
+                if not gtp_axis_process_groups and torch.distributed.is_initialized():
+                    gtp_axis_singleton = torch.distributed.new_group(
+                        ranks=[torch.distributed.get_rank()], use_local_synchronization=True
+                    )
+                    gtp_axis_process_groups = _get_gtp_remat_axis_group_kwargs(gtp_axis_singleton)
                 first_stage = is_pp_first_stage(pp_group)
                 last_stage = is_pp_last_stage(pp_group)
                 dp_cp_group = grid.get_pg(["dp", "cp"])
@@ -349,6 +374,7 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
                     pos_embd=pos_embd_pg if first_stage else None,
                     embd=embd_pg if (first_stage or last_stage) else None,
                     **gtp_remat_process_groups,
+                    **gtp_axis_process_groups,
                 )
             else:
                 pg_collections[module_name] = None

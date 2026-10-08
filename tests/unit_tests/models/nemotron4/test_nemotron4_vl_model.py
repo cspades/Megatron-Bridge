@@ -585,3 +585,25 @@ def test_legacy_alias_resolves_to_unified_classes():
 
     assert legacy.NM4LlavaModel is Nemotron4VLModel
     assert issubclass(legacy.ExperimentalNM4LlavaProvider, Nemotron4VLModelProvider)
+
+
+def test_finalize_disables_grad_accum_fusion_without_apex(monkeypatch):
+    monkeypatch.setattr(nm4_provider, "_has_apex_wgrad_fusion_kernel", lambda: False)
+    provider = Nemotron4VLModelProvider(
+        hidden_size=64,
+        ffn_hidden_size=128,
+        num_attention_heads=4,
+        kv_channels=16,
+        vocab_size=64,
+        hybrid_layer_pattern="M-*E",
+        mtp_num_layers=None,
+        mtp_hsm=False,
+        mtp_use_repeated_layer=False,
+        gradient_accumulation_fusion=True,
+    )
+    provider.finalize()
+    assert provider.gradient_accumulation_fusion is False
+    monkeypatch.setattr(nm4_provider, "_has_apex_wgrad_fusion_kernel", lambda: True)
+    provider.gradient_accumulation_fusion = True
+    provider.finalize()
+    assert provider.gradient_accumulation_fusion is True

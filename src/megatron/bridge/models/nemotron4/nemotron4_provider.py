@@ -31,6 +31,8 @@ settings as new, silently ignored fields on an MCore that lacks them.
 import argparse
 import copy
 import dataclasses
+import importlib.util
+import logging
 import os
 import tempfile
 from dataclasses import dataclass, field
@@ -85,6 +87,11 @@ def _missing_nemotron4_mcore_fields() -> list[str]:
     """Return the Nemotron4 config fields the installed MCore does not define."""
     defined = {config_field.name for config_field in dataclasses.fields(MCoreTransformerConfig)}
     return [name for name in NEMOTRON4_REQUIRED_MCORE_FIELDS if name not in defined]
+
+
+def _has_apex_wgrad_fusion_kernel() -> bool:
+    """Return whether MCore's non-TE ColumnParallelLinear can fuse weight-gradient accumulation."""
+    return importlib.util.find_spec("fused_weight_gradient_mlp_cuda") is not None
 
 
 def require_nemotron4_mcore() -> None:
@@ -149,6 +156,8 @@ def nemotron4_projector_gelu(x: torch.Tensor) -> torch.Tensor:
     """
     return 0.5 * x * (1.0 + torch.tanh(x * 0.7978845608 * (1.0 + 0.044715 * x * x)))
 
+
+logger = logging.getLogger(__name__)
 
 PRECISION_RECIPE_FILENAME = "precision_recipe.yaml"
 
@@ -287,6 +296,15 @@ class Nemotron4ModelProvider(HybridModelProvider):
     def finalize(self) -> None:
         """Check MCore support, then finalize as a hybrid model."""
         require_nemotron4_mcore()
+        if self.gradient_accumulation_fusion and not _has_apex_wgrad_fusion_kernel():
+            # The hybrid output layer and MTP projections are MCore ColumnParallelLinear, which
+            # implement this fusion only through the APEX kernel; TransformerEngine alone is not
+            # enough, so the generic "TE is installed" probe would make construction fail.
+            logger.warning(
+                "Disabling gradient_accumulation_fusion for Nemotron4: the fused_weight_gradient_mlp_cuda "
+                "APEX extension is not installed and MCore ColumnParallelLinear requires it."
+            )
+            self.gradient_accumulation_fusion = False
         super().finalize()
 
     def provide(self, pre_process=None, post_process=None, vp_stage=None):
