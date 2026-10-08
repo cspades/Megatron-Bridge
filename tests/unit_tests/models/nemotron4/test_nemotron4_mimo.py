@@ -152,3 +152,28 @@ def test_rejects_language_tp(monkeypatch):
     parallelism.module_parallelisms["language"].tensor_model_parallel_size = 2
     with pytest.raises(ValueError, match="language.tensor_model_parallel_size"):
         nemotron4_mimo_conversion_spec(bridge, hf, parallelism)
+
+
+def test_export_restores_fp32_for_hf_strict_fp32_state(monkeypatch):
+    """HF keeps controllers, A_log and the router correction bias in FP32; export must too."""
+    bridge, _ = _source(monkeypatch, 2)
+    converted = {
+        "model.language_model.layers.0.mixer.A_log": torch.ones(4, dtype=torch.bfloat16),
+        "model.language_model.layers.0.residual_connection.read_logit": torch.ones(3, dtype=torch.bfloat16),
+        "model.language_model.layers.0.shortcut_read.logit": torch.ones(3, dtype=torch.bfloat16),
+        "model.language_model.residual_readout.logit": torch.ones(3, dtype=torch.bfloat16),
+        "model.language_model.layers.0.moe.gate.e_score_correction_bias": torch.ones(4, dtype=torch.bfloat16),
+        "model.language_model.layers.0.self_attn.q_proj.weight": torch.ones(2, 2, dtype=torch.bfloat16),
+        "model.vision_tower.patch_conv.weight": torch.ones(2, 2, dtype=torch.bfloat16),
+    }
+    out = bridge.maybe_modify_converted_hf_weight(SimpleNamespace(), dict(converted), {})
+    fp32 = {name for name, tensor in out.items() if tensor.dtype == torch.float32}
+    assert fp32 == {
+        "model.language_model.layers.0.mixer.A_log",
+        "model.language_model.layers.0.residual_connection.read_logit",
+        "model.language_model.layers.0.shortcut_read.logit",
+        "model.language_model.residual_readout.logit",
+        "model.language_model.layers.0.moe.gate.e_score_correction_bias",
+    }
+    assert out["model.language_model.layers.0.self_attn.q_proj.weight"].dtype == torch.bfloat16
+    assert out["model.vision_tower.patch_conv.weight"].dtype == torch.bfloat16

@@ -54,7 +54,7 @@ import torch
 from torch import nn
 
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
-from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
+from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge, WeightConversionTask
 from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
     ColumnParallelMapping,
@@ -200,6 +200,10 @@ class _SingleTPColumnMapping(ColumnParallelMapping):
 
 _warned_dropped_megatron_state: set[str] = set()
 
+# Mirrors ``Nemotron4PreTrainedModel._keep_in_fp32_modules_strict`` in the HF remote code:
+# routing and wide-residual controller state stays FP32 through load and dtype casts.
+_HF_FP32_SUFFIXES = ("e_score_correction_bias", "read_logit", "write_logit", "retention_logit", ".logit", "A_log")
+
 
 class _MegatronOnlyStateMapping(MegatronParamMapping[torch.Tensor]):
     """Megatron state with no HF counterpart: keep it on import, omit it on export."""
@@ -315,6 +319,25 @@ class Nemotron4Bridge(MegatronModelBridge):
         if isinstance(hf_param, str) and hf_param.startswith(_MEGATRON_ONLY_PREFIX):
             return None
         return super().maybe_modify_loaded_hf_weight(hf_param, hf_state_dict)
+
+    def maybe_modify_converted_hf_weight(
+        self,
+        task: WeightConversionTask,
+        converted_weights_dict: dict[str, torch.Tensor],
+        hf_state_dict: Mapping[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """Restore FP32 storage for the tensors ``Nemotron4ForConditionalGeneration`` keeps in FP32.
+
+        Megatron trains the wide-residual controllers, GDP ``A_log`` and the router correction
+        bias under its BF16 parameter dtype (``Float16Module``), while the HF model lists them in
+        ``_keep_in_fp32_modules_strict``. Export them as FP32 so the HF checkpoint matches the
+        source layout and the HF model does not re-cast on load.
+        """
+        converted = super().maybe_modify_converted_hf_weight(task, converted_weights_dict, hf_state_dict)
+        return {
+            name: (tensor.float() if tensor.is_floating_point() and name.endswith(_HF_FP32_SUFFIXES) else tensor)
+            for name, tensor in converted.items()
+        }
 
     def mapping_registry(self) -> MegatronMappingRegistry:
         """Return the Nemotron4 VLM parameter mappings."""
