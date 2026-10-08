@@ -516,14 +516,35 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
         vision_config.recompute_num_layers = self.vision_recompute_num_layers
 
     def _apply_gtp_weight_shards(self) -> None:
+        """Reconcile the GTP sizes with the logical weight-shard counts.
+
+        Two callers set these differently. NeMo RL sets ``gtp_weight_remat_size`` /
+        ``expert_gtp_weight_remat_size`` through ``model_overrides`` and leaves the shard
+        counts derived. Bridge's ``load_megatron_model`` resets the GTP sizes to 1 and passes
+        the saved topology as shard counts through ``mp_overrides``. An explicit shard count
+        larger than the parallel size therefore wins over a default GTP size of 1; otherwise
+        the GTP size drives the shard count.
+        """
         if self.gtp_weight_remat_size < 1 or self.expert_gtp_weight_remat_size < 1:
             raise ValueError("gtp_weight_remat_size and expert_gtp_weight_remat_size must be >= 1")
         if self.expert_tensor_parallel_size is None and self.expert_model_parallel_size > 1:
             self.expert_tensor_parallel_size = 1
-        self.tensor_parallel_num_weight_shards = self.tensor_model_parallel_size * self.gtp_weight_remat_size
-        self.expert_tensor_parallel_num_weight_shards = (
-            self.expert_tensor_parallel_size or 1
-        ) * self.expert_gtp_weight_remat_size
+        for shards_name, parallel_size, remat_name in (
+            ("tensor_parallel_num_weight_shards", self.tensor_model_parallel_size, "gtp_weight_remat_size"),
+            (
+                "expert_tensor_parallel_num_weight_shards",
+                self.expert_tensor_parallel_size or 1,
+                "expert_gtp_weight_remat_size",
+            ),
+        ):
+            shards = getattr(self, shards_name)
+            remat = getattr(self, remat_name)
+            if remat == 1 and isinstance(shards, int) and shards > parallel_size:
+                if shards % parallel_size:
+                    raise ValueError(f"{shards_name}={shards} must be a multiple of the parallel size {parallel_size}")
+                remat = shards // parallel_size
+                setattr(self, remat_name, remat)
+            setattr(self, shards_name, parallel_size * remat)
 
     # ------------------------------------------------------------------ precision recipe
     def _load_precision_recipe_yaml(self) -> None:
@@ -628,9 +649,9 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
 
     def finalize(self) -> None:
         """Check MCore support, reconcile hybrid/MTP fields, then derive GTP from TP/GTP."""
+        self._apply_gtp_weight_shards()
         requested_gtp = self.gtp_weight_remat_size
         requested_expert_gtp = self.expert_gtp_weight_remat_size
-        self._apply_gtp_weight_shards()
         super().finalize()
         if self.gtp_weight_remat_size != requested_gtp or self.expert_gtp_weight_remat_size != requested_expert_gtp:
             raise ValueError(

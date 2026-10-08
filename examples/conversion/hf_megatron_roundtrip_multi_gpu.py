@@ -164,6 +164,9 @@ def main(
     distributed_save: bool = True,
     skip_save: bool = False,
     atol: float = 1e-1,
+    tp_shards: int | None = None,
+    etp_shards: int | None = None,
+    skip_verify: bool = False,
     rtol: float = 1e-5,
 ) -> None:
     """Perform round-trip conversion between HuggingFace and Megatron-LM models on multiple GPUs."""
@@ -196,20 +199,29 @@ def main(
         model_provider.params_dtype = torch.bfloat16
         model_provider.expert_model_parallel_size = ep
         model_provider.expert_tensor_parallel_size = etp
+        # Native GTP checkpoints must be loaded at their saved weight-shard topology
+        # (shards = TP * GTP per axis); see docs/training/checkpointing.md.
+        mp_overrides = {
+            "tensor_model_parallel_size": tp,
+            "pipeline_model_parallel_size": pp,
+            "expert_model_parallel_size": ep,
+            "expert_tensor_parallel_size": etp,
+            "pipeline_dtype": torch.bfloat16,
+            "params_dtype": torch.bfloat16,
+        }
+        if tp_shards is not None:
+            model_provider.tensor_parallel_num_weight_shards = tp_shards
+            mp_overrides["tensor_parallel_num_weight_shards"] = tp_shards
+        if etp_shards is not None:
+            model_provider.expert_tensor_parallel_num_weight_shards = etp_shards
+            mp_overrides["expert_tensor_parallel_num_weight_shards"] = etp_shards
 
         # Once all overrides are set, finalize the model provider to ensure the post initialization logic is run
         model_provider.finalize()
         model_provider.initialize_model_parallel(seed=0)
         megatron_model = bridge.load_megatron_model(
             megatron_load_path,
-            mp_overrides={
-                "tensor_model_parallel_size": tp,
-                "pipeline_model_parallel_size": pp,
-                "expert_model_parallel_size": ep,
-                "expert_tensor_parallel_size": etp,
-                "pipeline_dtype": torch.bfloat16,
-                "params_dtype": torch.bfloat16,
-            },
+            mp_overrides=mp_overrides,
             wrap_with_ddp=False,
         )
         megatron_model = [m.cuda() for m in megatron_model]
@@ -257,7 +269,9 @@ def main(
     mismatch_samples: list[str] = []
     fp8_skip_count = 0
     fp8_skip_samples: list[str] = []
-    for name, param in bridge.export_hf_weights(megatron_model, show_progress=False):
+    if skip_verify and is_rank_0:
+        console.print("[yellow]--skip-verify: not comparing exported weights against the HF source[/yellow]")
+    for name, param in [] if skip_verify else bridge.export_hf_weights(megatron_model, show_progress=False):
         if is_rank_0:
             original_param = bridge.hf_pretrained.state[name]
             compare_param = param
@@ -356,6 +370,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pp", type=int, default=1, help="Pipeline parallelism size")
     parser.add_argument("--ep", type=int, default=1, help="Expert parallelism size")
     parser.add_argument("--etp", type=int, default=1, help="Expert tensor parallelism size")
+    parser.add_argument(
+        "--tp-shards",
+        type=int,
+        default=None,
+        help="Dense weight-shard count (TP * GTP) of a native GTP checkpoint being loaded; must match the saved value",
+    )
+    parser.add_argument(
+        "--etp-shards",
+        type=int,
+        default=None,
+        help="Expert weight-shard count (ETP * expert GTP) of a native GTP checkpoint being loaded; must match the saved value",
+    )
 
     parser.add_argument(
         "--megatron-save-path",
@@ -387,6 +413,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--skip-save", action="store_true", help="Skip saving the model after comparison (verification only)"
     )
+    parser.add_argument(
+        "--skip-verify",
+        action="store_true",
+        help="Skip comparing exported weights against the HF source (for trained Megatron checkpoints)",
+    )
     parser.add_argument("--atol", type=float, default=1e-1, help="Absolute tolerance for tensor comparison")
     parser.add_argument("--rtol", type=float, default=1e-5, help="Relative tolerance for tensor comparison")
     return parser
@@ -409,6 +440,9 @@ if __name__ == "__main__":
         skip_save=args.skip_save,
         atol=args.atol,
         rtol=args.rtol,
+        tp_shards=args.tp_shards,
+        etp_shards=args.etp_shards,
+        skip_verify=args.skip_verify,
     )
 
     if torch.distributed.is_initialized():

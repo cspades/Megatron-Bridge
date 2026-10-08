@@ -607,3 +607,41 @@ def test_finalize_disables_grad_accum_fusion_without_apex(monkeypatch):
     provider.gradient_accumulation_fusion = True
     provider.finalize()
     assert provider.gradient_accumulation_fusion is True
+
+
+def _tiny_provider(**kw):
+    return Nemotron4VLModelProvider(
+        hidden_size=64,
+        ffn_hidden_size=128,
+        num_attention_heads=4,
+        kv_channels=16,
+        vocab_size=64,
+        hybrid_layer_pattern="M-*E",
+        mtp_num_layers=None,
+        mtp_hsm=False,
+        mtp_use_repeated_layer=False,
+        **kw,
+    )
+
+
+def test_gtp_sizes_drive_shard_counts_for_recipes():
+    """NeMo RL sets the GTP sizes and leaves the shard counts derived."""
+    provider = _tiny_provider(gtp_weight_remat_size=2, expert_gtp_weight_remat_size=4, expert_tensor_parallel_size=1)
+    provider.finalize()
+    assert provider.tensor_parallel_num_weight_shards == 2
+    assert provider.expert_tensor_parallel_num_weight_shards == 4
+    assert (provider.gtp_weight_remat_size, provider.expert_gtp_weight_remat_size) == (2, 4)
+
+
+def test_explicit_shard_counts_drive_gtp_sizes_for_checkpoint_loads():
+    """load_megatron_model resets GTP sizes to 1 and passes the saved topology as shard counts."""
+    provider = _tiny_provider(expert_tensor_parallel_size=1)
+    provider.tensor_parallel_num_weight_shards = 1
+    provider.expert_tensor_parallel_num_weight_shards = 4
+    provider.finalize()
+    assert (provider.gtp_weight_remat_size, provider.expert_gtp_weight_remat_size) == (1, 4)
+    assert provider.expert_tensor_parallel_num_weight_shards == 4
+    bad = _tiny_provider(tensor_model_parallel_size=2)
+    bad.tensor_parallel_num_weight_shards = 3
+    with pytest.raises(ValueError, match="multiple of the parallel size"):
+        bad.finalize()
