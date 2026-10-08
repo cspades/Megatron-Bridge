@@ -66,6 +66,14 @@ def _validate_checkpoint_weight_topology(
     expert_changed = (saved[3] > 1 or requested[3] > 1) and saved[2:] != requested[2:]
     if not dense_changed and not expert_changed:
         return
+    # TODO(nemotron4): this guard exists because MCore's SwiGLU (gated_linear_unit) checkpoint
+    # layout interleaves gate/up rows per GTP shard, so reassembling shards as contiguous rows
+    # reorders them. Nemotron4 uses non-gated squared-ReLU MLPs/experts and never GTP-shards its
+    # vision tower, so a GTP reshard of a Nemotron4 checkpoint is a plain contiguous row gather.
+    # Consider relaxing the check when the saved model config has gated_linear_unit=False (and
+    # no gated expert/vision weights under GTP) so single-GPU export does not require loading at
+    # the saved GTP topology. Until then use the documented route: export HF at the saved
+    # topology, then import HF into the new topology.
     raise ValueError(
         "Resharding a GTP checkpoint is not supported: Megatron-Core's SwiGLU checkpoint "
         "layout can reorder gate/up rows when the weight-sharding topology changes. "
