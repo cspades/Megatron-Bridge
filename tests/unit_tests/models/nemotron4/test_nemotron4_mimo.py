@@ -177,3 +177,8 @@ def test_export_restores_fp32_for_hf_strict_fp32_state(monkeypatch):
     }
     assert out["model.language_model.layers.0.self_attn.q_proj.weight"].dtype == torch.bfloat16
     assert out["model.vision_tower.patch_conv.weight"].dtype == torch.bfloat16
+
+
+def test_export_copies_processor_config_from_source():
+    """OpenCV-free environments cannot instantiate the Nemotron4 processor; copy its config."""
+    assert "processor_config.json" in Nemotron4Bridge.ADDITIONAL_FILE_PATTERNS

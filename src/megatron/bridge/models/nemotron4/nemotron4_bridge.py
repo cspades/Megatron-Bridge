@@ -239,6 +239,12 @@ class _MegatronOnlyStateMapping(MegatronParamMapping[torch.Tensor]):
 class Nemotron4Bridge(MegatronModelBridge):
     """Bridge between HF ``Nemotron4ForConditionalGeneration`` and :class:`Nemotron4VLModel`."""
 
+    # The HF export copies these from the source checkpoint. ``Nemotron4ImageProcessor``
+    # refuses to construct without OpenCV, so ``AutoProcessor`` cannot be instantiated in
+    # OpenCV-free conversion environments and the processor's own ``save_pretrained`` never
+    # runs; copy its config verbatim instead so the exported directory loads as a VLM.
+    ADDITIONAL_FILE_PATTERNS = ["processor_config.json", "preprocessor_config.json"]
+
     def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> Nemotron4VLModelProvider:
         """Build a :class:`Nemotron4VLModelProvider` from the HF config.
 
