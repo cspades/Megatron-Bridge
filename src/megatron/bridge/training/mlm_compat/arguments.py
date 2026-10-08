@@ -70,6 +70,14 @@ def _transformer_config_from_args(
     args: argparse.Namespace, config_class: type[TransformerConfig] = TransformerConfig
 ) -> TransformerConfig:
     """Build a variant of TransformerConfig based on contents of the MLM argparse args object."""
+    # Nemotron4 checkpoints from the NM4 Megatron-LM fork carry nested wide-residual and
+    # precision configs that the generic field-by-field mapping below does not construct.
+    # Delegate to the fork's own builder, which knows how to assemble them.
+    if getattr(args, "wide_residual_num_streams", None) is not None:
+        from megatron.training.argument_utils import core_transformer_config_from_args
+
+        return core_transformer_config_from_args(args, config_class=config_class)
+
     multi_latent_attention = getattr(args, "multi_latent_attention", False)
     if multi_latent_attention:
         config_class = MLATransformerConfig

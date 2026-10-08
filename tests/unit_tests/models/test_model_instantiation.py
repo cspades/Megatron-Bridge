@@ -401,6 +401,7 @@ class TestGetModel:
             model_provider,
             ddp_config,
             use_layer_wise_distributed_optimizer=use_layer_wise,
+            use_layer_wise_param_layout=not use_layer_wise,
             pg_collection=pg,
         )
 
@@ -412,6 +413,7 @@ class TestGetModel:
         mock_print_params.assert_called_once()
         mock_ddp_wrap.assert_called_once()
         assert mock_ddp_wrap.call_args.kwargs["use_layer_wise_distributed_optimizer"] is use_layer_wise
+        assert mock_ddp_wrap.call_args.kwargs["use_layer_wise_param_layout"] is (not use_layer_wise)
 
     @patch("megatron.bridge.models.model_provider._create_model")
     @patch("megatron.bridge.models.model_provider._print_num_params")

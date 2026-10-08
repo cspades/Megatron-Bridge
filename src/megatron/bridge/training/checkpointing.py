@@ -1682,6 +1682,14 @@ def save_checkpoint(
 
                 cfg.to_yaml(config_filename)
 
+                # Providers that materialize a Transformer Engine precision recipe (NM4 MXFP8)
+                # copy it next to run_config.yaml so resume does not need the source checkpoint.
+                save_precision_recipe_assets = getattr(
+                    getattr(cfg, "model", None), "save_precision_recipe_assets", None
+                )
+                if callable(save_precision_recipe_assets):
+                    save_precision_recipe_assets(checkpoint_name)
+
                 # Save tokenizer files for self-contained checkpoints (if enabled)
                 if ckpt_cfg.save_tokenizer_assets:
                     tokenizer_instance = getattr(cfg.dataset, "tokenizer", None) if cfg.dataset else None
