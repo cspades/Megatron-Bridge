@@ -234,6 +234,12 @@ def main(
         model_provider.params_dtype = torch.bfloat16
         model_provider.expert_model_parallel_size = ep
         model_provider.expert_tensor_parallel_size = etp
+        # Import HF weights directly into a GTP topology (shards = TP * GTP per axis):
+        # the bridge slices each mapped TP-local tensor into this rank's stored row shard.
+        if tp_shards is not None:
+            model_provider.tensor_parallel_num_weight_shards = tp_shards
+        if etp_shards is not None:
+            model_provider.expert_tensor_parallel_num_weight_shards = etp_shards
 
         # Once all overrides are set, finalize the model provider to ensure the post initialization logic is run
         model_provider.finalize()
