@@ -16,6 +16,8 @@ from megatron.core.models.mimo.model import MimoEncoderFloat16Module
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 
+from megatron.bridge.models.common.unimodal import _ddp_wrap
+
 
 if TYPE_CHECKING:
     from megatron.core.distributed import DistributedDataParallelConfig
@@ -39,12 +41,47 @@ def _wrap_mixed_precision(
     return wrapper(config, module)
 
 
+def _wrap_ddp(
+    module: torch.nn.Module,
+    config: TransformerConfig,
+    ddp_config: "DistributedDataParallelConfig",
+    pg_collection: "ProcessGroupCollection",
+    *,
+    use_layer_wise_distributed_optimizer: bool,
+) -> torch.nn.Module:
+    """Wrap one MIMO component with MCore DDP over the component's process groups."""
+    # As in Core's optimizer setup: without the distributed optimizer, the layer-wise
+    # optimizer works on the plain (unpadded) DDP buffers.
+    if not (use_layer_wise_distributed_optimizer and ddp_config.use_distributed_optimizer):
+        from megatron.core.distributed import DistributedDataParallel
+
+        return DistributedDataParallel(
+            config=config,
+            ddp_config=ddp_config,
+            module=module,
+            pg_collection=pg_collection,
+        )
+
+    # As in get_model(): route Muon-managed parameters to shard-aligned DDP buffers.
+    return _ddp_wrap(
+        [module],
+        # The DDP path above does not broadcast parameters either.
+        data_parallel_random_init=False,
+        ddp_config=ddp_config,
+        overlap_param_gather_with_optimizer_step=False,
+        pg_collection=pg_collection,
+        use_layer_wise_distributed_optimizer=True,
+    )[0]
+
+
 def wrap_megatron_mimo_model_distributed(
     megatron_mimo_model: "MimoModel",
     ddp_config: "DistributedDataParallelConfig",
     megatron_mimo_parallelism_config: "MegatronMIMOParallelismConfig",
     grids: Dict[str, "HyperCommGrid"],
     pg_collections: Dict[str, Optional["ProcessGroupCollection"]],
+    *,
+    use_layer_wise_distributed_optimizer: bool = False,
 ) -> "MimoModel":
     """Wrap MegatronMIMO model's submodules with mixed precision and DDP.
 
@@ -56,12 +93,13 @@ def wrap_megatron_mimo_model_distributed(
         megatron_mimo_parallelism_config: MegatronMIMO parallelism configuration.
         grids: Module name to HyperCommGrid mapping.
         pg_collections: Module name to ProcessGroupCollection mapping.
+        use_layer_wise_distributed_optimizer: The layer-wise distributed optimizer (e.g. Muon)
+            is used. With ``ddp_config.use_distributed_optimizer``, DDP then gets the
+            shard-aligned buffer layout that it requires.
 
     Returns:
         The same megatron_mimo_model with wrapped submodules.
     """
-    from megatron.core.distributed import DistributedDataParallel
-
     # Lazy import to avoid circular dependency (models layer loads before training layer)
     from megatron.bridge.training.megatron_mimo_parallel_utils import is_current_rank_in_grid
 
@@ -77,11 +115,12 @@ def wrap_megatron_mimo_model_distributed(
                     language_config,
                     encoder=False,
                 )
-                wrapped_lm = DistributedDataParallel(
-                    config=language_config,
-                    ddp_config=ddp_config,
-                    module=language_model,
-                    pg_collection=llm_pg,
+                wrapped_lm = _wrap_ddp(
+                    language_model,
+                    language_config,
+                    ddp_config,
+                    llm_pg,
+                    use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
                 )
                 # MCore's DDP wrapper does not proxy arbitrary module methods.
                 # MimoModel._forward_language_module() checks for and calls
@@ -127,11 +166,12 @@ def wrap_megatron_mimo_model_distributed(
                     component_config,
                     encoder=True,
                 )
-                wrapped = DistributedDataParallel(
-                    config=component_config,
-                    ddp_config=ddp_config,
-                    module=precision_wrapped,
-                    pg_collection=module_pg,
+                wrapped = _wrap_ddp(
+                    precision_wrapped,
+                    component_config,
+                    ddp_config,
+                    module_pg,
+                    use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
                 )
                 # MCore optimizers unwrap DDP and read process groups from the wrapped module.
                 wrapped.module.pg_collection = module_pg
