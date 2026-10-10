@@ -14,6 +14,7 @@
 
 import argparse
 import logging
+import os
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Generator, Literal, Optional, Union
@@ -562,6 +563,12 @@ def load_megatron_model(
         if tp * ep == 1:
             model_cfg.moe_token_dispatcher_type = "allgather"
             model_cfg.moe_shared_expert_overlap = False
+            # MCore rejects router padding for quantization with the allgather dispatcher; the
+            # padding only aligns dispatch inputs for quantized grouped GEMMs, so drop it with
+            # the fallback instead of failing to load checkpoints saved with it enabled.
+            for padding_field in ("moe_router_padding_for_quantization", "moe_router_padding_for_fp8"):
+                if getattr(model_cfg, padding_field, False):
+                    setattr(model_cfg, padding_field, False)
 
     return build_and_load_model(
         checkpoint_path, model_cfg, model_type, mlm_args, return_state_dict, use_cpu_init, skip_temp_dist_context
@@ -690,8 +697,18 @@ def save_megatron_model(
                 if "raise_on_error" not in str(type_error):
                     raise
                 # Older Megatron-LM (e.g. the Nemotron4 fork) predates the raise_on_error
-                # keyword; its save_tokenizer_assets raises on failure unconditionally.
+                # keyword and logs save failures instead of raising. Re-run the HF save
+                # directly when nothing was written so the real error surfaces.
                 save_tokenizer_assets(tokenizer, tokenizer_config, checkpoint_name)
+                hf_tokenizer = (
+                    tokenizer if hasattr(tokenizer, "save_pretrained") else getattr(tokenizer, "_tokenizer", None)
+                )
+                tokenizer_dir = os.path.join(checkpoint_name, "tokenizer")
+                if hasattr(hf_tokenizer, "save_pretrained") and not (
+                    os.path.isdir(tokenizer_dir) and os.listdir(tokenizer_dir)
+                ):
+                    os.makedirs(tokenizer_dir, exist_ok=True)
+                    hf_tokenizer.save_pretrained(tokenizer_dir)
         except Exception as error:
             tokenizer_error = error
 

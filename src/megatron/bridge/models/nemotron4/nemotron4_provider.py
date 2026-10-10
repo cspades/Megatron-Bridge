@@ -257,6 +257,12 @@ class Nemotron4ModelProvider(HybridModelProvider):
     activation_func_tanh_clamp_scale: float | None = 16.0
     attention_softmax_in_fp32: bool = False
     init_method_std: float = 0.0162
+    # Runtime defaults the pretraining run used (Megatron-LM argument defaults). The native
+    # checkpoint path hydrates these from saved_args; set them here so an HF-derived provider
+    # builds the same config without a native checkpoint.
+    cp_comm_type: str | list[str] | None = "p2p"
+    masked_softmax_fusion: bool = True
+    persist_layer_norm: bool = True
 
     # Gated delta product mixers reuse the Mamba head/group fields.
     mamba_num_heads: int | None = 24
@@ -624,6 +630,14 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
             return
         self._saved_args = None
         if self.saved_args is not None:
+            if "vlm_checkpoint_layout" not in self.saved_args:
+                raise ValueError(
+                    "saved_args is the argparse namespace of a hand-converted native Nemotron4 "
+                    "checkpoint and is only set by that checkpoint's run_config.yaml; got a partial "
+                    f"dict with keys {sorted(self.saved_args)}. Runtime knobs such as attention_backend "
+                    "belong on the provider fields directly (for NeMo RL: policy.megatron_cfg.*), not under "
+                    "model_overrides.saved_args."
+                )
             # Resume: run_config already carries the hydrated architecture fields.
             args = _namespace_from_dict(self.saved_args)
             _validate_native_args(args)
@@ -649,6 +663,11 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
 
     def finalize(self) -> None:
         """Check MCore support, reconcile hybrid/MTP fields, then derive GTP from TP/GTP."""
+        if getattr(self, "_saved_args", None) is None:
+            # No native checkpoint to fill these in: "not requested" means "not frozen".
+            for name in ("freeze_language_model", "freeze_vision_model", "freeze_vision_projection"):
+                if getattr(self, name) is None:
+                    setattr(self, name, False)
         self._apply_gtp_weight_shards()
         requested_gtp = self.gtp_weight_remat_size
         requested_expert_gtp = self.expert_gtp_weight_remat_size

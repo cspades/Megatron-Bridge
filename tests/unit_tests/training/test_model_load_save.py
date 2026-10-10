@@ -560,6 +560,10 @@ class TestLoadMegatronModel:
             moe_shared_expert_overlap=True,
             moe_token_dispatcher_type="flex",
             moe_flex_dispatcher_backend="hybridep",
+            # Saved by quantized training runs; MCore rejects the padding with the allgather dispatcher.
+            fp8="e4m3",
+            fp8_recipe="mxfp8",
+            moe_router_padding_for_quantization=True,
         )
 
         def finalize_before_build(checkpoint_path, model_cfg, *args, **build_kwargs):
@@ -574,6 +578,7 @@ class TestLoadMegatronModel:
 
         assert provider.moe_token_dispatcher_type == expected_dispatcher
         assert provider.moe_shared_expert_overlap is expected_overlap
+        assert provider.moe_router_padding_for_quantization is expected_overlap
 
     def test_load_model_config_preserves_finalized_pipeline_layout(self, tmp_path):
         """Verify native checkpoints retain a finalized custom pipeline layout."""
