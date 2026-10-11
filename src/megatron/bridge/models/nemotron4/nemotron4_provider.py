@@ -45,9 +45,7 @@ from megatron.core import dist_checkpointing
 from megatron.core.activations import squared_relu
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TERowParallelLinear
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
-from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
-from megatron.core.models.vision.vit_model import ViTModel
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
@@ -59,6 +57,8 @@ from megatron.bridge.models.hybrid.hybrid_provider import HybridModelProvider
 from megatron.bridge.models.nemotron4.modeling_nemotron4_vl import (
     Nemotron4GatedDeltaProductMixer,
     Nemotron4MIMOLanguageModel,
+    Nemotron4MIMOProjector,
+    Nemotron4MIMOVisionEncoder,
     Nemotron4VisionMLP,
     Nemotron4VLModel,
 )
@@ -365,6 +365,10 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
     vision_recompute_granularity: Literal["full", "selective"] | None = None
     vision_recompute_method: Literal["uniform", "block"] | None = None
     vision_recompute_num_layers: int | None = None
+    mimo_encoder_dp_media_balance: bool = False
+    """MegatronMIMO: divide the images over the encoder data-parallel ranks (Core's media balancer)."""
+    mimo_encoder_dp_media_frame_weight: int = 165
+    """Per-frame cost, in patches, that the media balancer adds to each image."""
 
     # --- legacy native-checkpoint hydration (non-MIMO checkpoints converted from the fork) ---
     checkpoint_path: str = ""
@@ -392,7 +396,7 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
             module=Nemotron4MIMOLanguageModel,
             params={
                 "config": config,
-                "hybrid_stack_spec": config._resolve_hybrid_stack_spec(),
+                "hybrid_stack_spec": self._language_layer_spec(),
                 "vocab_size": config.vocab_size,
                 "max_sequence_length": config.seq_length,
                 "hybrid_layer_pattern": config.hybrid_layer_pattern,
@@ -408,16 +412,33 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
 
     def build_mimo_modality_submodules_spec(self) -> dict[str, ModuleSpec]:
         """Build a Pixtral encoder and separate projector on the image component."""
-        language_config = self._copy_config_without_runtime_process_groups(deep=True)
-        vision_config = _dense_config(self._build_vision_config(language_config))
-        projection_config = _dense_config(self._build_vision_projection_config(language_config))
+        vision_config, projection_config = self._vision_configs(
+            self._copy_config_without_runtime_process_groups(deep=True)
+        )
+        modality_module, modality_params = VisionModalitySubmodules, {}
+        if self.mimo_encoder_dp_media_balance:
+            # Imported here: Megatron-LM forks without the media balancer still load this provider.
+            from megatron.core.models.mimo.submodules.encoder_dp_media_balancer import (
+                EncoderDPMediaBalancedVisionSubmodules,
+            )
+
+            modality_module = EncoderDPMediaBalancedVisionSubmodules
+            modality_params = {
+                "encoder_name": "pixtral",
+                "frame_weight": self.mimo_encoder_dp_media_frame_weight,
+                "language_hidden_size": self.hidden_size,
+                "pixel_dtype": vision_config.params_dtype,
+                "patch_dim": self.patch_dim,
+                "temporal_patch_size": 1,
+            }
         return {
             "images": ModuleSpec(
-                module=VisionModalitySubmodules,
+                module=modality_module,
+                params=modality_params,
                 submodules={
                     "encoders": {
                         "pixtral": ModuleSpec(
-                            module=ViTModel,
+                            module=Nemotron4MIMOVisionEncoder,
                             params={
                                 "transformer_config": vision_config,
                                 "transformer_layer_spec": get_vit_layer_with_transformer_engine_spec(),
@@ -435,7 +456,7 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
                     },
                     "input_projections": [
                         ModuleSpec(
-                            module=MultimodalProjector,
+                            module=Nemotron4MIMOProjector,
                             params={
                                 "config": projection_config,
                                 "submodules": nemotron4_projection_submodules(),
@@ -447,6 +468,20 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
                 },
             )
         }
+
+    def _vision_configs(
+        self, language_cfg: "Nemotron4VLModelProvider"
+    ) -> tuple[MCoreTransformerConfig, MCoreTransformerConfig]:
+        """Derive the BF16 ViT and projector configs, with the requested ViT recompute."""
+        vision_cfg = _dense_config(self._build_vision_config(language_cfg))
+        projection_cfg = _dense_config(self._build_vision_projection_config(language_cfg))
+        self._apply_vision_recompute_settings(vision_cfg)
+        for config in (vision_cfg, projection_cfg):
+            # The encoder and projector stay in BF16 regardless of the decoder's FP8/MXFP8 recipe.
+            config.fp8 = None
+            config.fp8_param = False
+            config.quant_recipe = None
+        return vision_cfg, projection_cfg
 
     def _build_vision_config(self, language_cfg: "Nemotron4VLModelProvider") -> "Nemotron4VLModelProvider":
         """Derive the ViT config from a language config copy.
@@ -732,14 +767,7 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
         """Build the Nemotron4 VLM for the current provider parallel sizes."""
         require_nemotron4_mcore()
         language_cfg = self._copy_config_without_runtime_process_groups(deep=True)
-        vision_cfg = _dense_config(self._build_vision_config(language_cfg))
-        projection_cfg = _dense_config(self._build_vision_projection_config(language_cfg))
-        self._apply_vision_recompute_settings(vision_cfg)
-        for config in (vision_cfg, projection_cfg):
-            # The encoder and projector stay in BF16 regardless of the decoder's FP8/MXFP8 recipe.
-            config.fp8 = None
-            config.fp8_param = False
-            config.quant_recipe = None
+        vision_cfg, projection_cfg = self._vision_configs(language_cfg)
 
         pg_collection = self._pg_collection
         if pg_collection is None:

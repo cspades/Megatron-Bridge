@@ -501,6 +501,7 @@ RECIPE_PROVIDER_FIELDS = (
     "vision_recompute_granularity",
     "vision_recompute_method",
     "vision_recompute_num_layers",
+    "mimo_encoder_dp_media_balance",
     "freeze_language_model",
     "freeze_vision_model",
     "freeze_vision_projection",
