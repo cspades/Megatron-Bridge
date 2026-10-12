@@ -192,6 +192,7 @@ def setup_megatron_mimo(
         fp16=getattr(cfg.model, "fp16", False),
         bf16=getattr(cfg.model, "bf16", True),
         seed=cfg.rng.seed,
+        use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
     )
 
     logger.info(f"Rank {dist.get_rank()}: Creating multimodule communicator")
