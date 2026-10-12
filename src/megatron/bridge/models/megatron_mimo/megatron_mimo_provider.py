@@ -540,6 +540,7 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
             ]
         ] = None,
         post_wrap_hook: Optional[Callable[[List[MegatronModule]], List[MegatronModule]]] = None,
+        *,
         infra: MegatronMIMOInfra | None = None,
     ) -> List[MegatronModule]:
         """Build MegatronMIMO model with heterogeneous parallelism and DDP wrapping.

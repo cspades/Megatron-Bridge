@@ -84,6 +84,7 @@ def test_build_megatron_mimo_model_creates_process_groups_once(monkeypatch):
         _, infra = build_megatron_mimo_model(provider, ddp_config=MagicMock(), bf16=False)
 
     build_grids_spy.assert_called_once()
+    assert provider._grids is infra.module_to_grid_map
     mimo_config = mock_mimo_model.call_args.args[0]
     assert mimo_config.module_to_grid_map is infra.module_to_grid_map
     assert mimo_config.language_model_spec.params["pg_collection"] is infra.pg_collections["language"]
