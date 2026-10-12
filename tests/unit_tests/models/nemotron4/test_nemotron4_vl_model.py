@@ -33,6 +33,54 @@ def _provider_with_recompute(**overrides):
     return provider
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize("builder", ["_build_vision_config", "_build_vision_projection_config"])
+def test_dense_configs_clear_language_controls_without_changing_language(builder: str) -> None:
+    provider = Nemotron4VLModelProvider(
+        hybrid_layer_pattern="M-*E",
+        hidden_size=128,
+        ffn_hidden_size=256,
+        num_attention_heads=4,
+        kv_channels=32,
+        vocab_size=128,
+        num_moe_experts=4,
+        moe_router_topk=2,
+        moe_ffn_hidden_size=128,
+        moe_grouped_gemm=True,
+        moe_use_grouped_tensor=True,
+        use_transformer_engine_op_fuser=True,
+        fp8="e4m3",
+        fp8_recipe="mxfp8",
+        fp8_param=True,
+        first_last_layers_bf16=True,
+        num_layers_at_start_in_bf16=2,
+        num_layers_at_end_in_bf16=4,
+        vision_num_layers=1,
+        vision_hidden_size=64,
+        vision_ffn_hidden_size=128,
+        vision_num_attention_heads=4,
+        vision_kv_channels=16,
+    )
+    language_config = provider._copy_config_without_runtime_process_groups(deep=True)
+
+    dense_config = nm4_provider._dense_config(getattr(provider, builder)(language_config))
+
+    assert dense_config.num_moe_experts is None
+    assert not dense_config.moe_grouped_gemm
+    assert not dense_config.moe_use_grouped_tensor
+    assert language_config.moe_grouped_gemm
+    assert language_config.moe_use_grouped_tensor
+    assert provider.moe_grouped_gemm
+    assert provider.moe_use_grouped_tensor
+    assert not dense_config.first_last_layers_bf16
+    assert dense_config.num_layers_at_start_in_bf16 == 0
+    assert dense_config.num_layers_at_end_in_bf16 == 0
+    for config in (provider, language_config):
+        assert config.first_last_layers_bf16
+        assert config.num_layers_at_start_in_bf16 == 2
+        assert config.num_layers_at_end_in_bf16 == 4
+
+
 def test_provider_exposes_vision_recompute_fields():
     field_names = {field.name for field in fields(Nemotron4VLModelProvider)}
 

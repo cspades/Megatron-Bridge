@@ -794,12 +794,16 @@ def _make_dense_non_hybrid(config: MCoreTransformerConfig) -> None:
     config.activation_func_tanh_clamp_scale = None
     config.fp32_residual_connection = False
     config.pipeline_dtype = config.params_dtype
+    config.first_last_layers_bf16 = False
+    config.num_layers_at_start_in_bf16 = 0
+    config.num_layers_at_end_in_bf16 = 0
     config.mtp_num_layers = None
     config.mtp_use_repeated_layer = False
     config.num_moe_experts = None
     config.moe_ffn_hidden_size = None
     config.moe_shared_expert_intermediate_size = None
     config.moe_grouped_gemm = False
+    config.moe_use_grouped_tensor = False
     config.moe_router_fusion = False
     config.moe_permute_fusion = False
     config.moe_shared_expert_overlap = False
