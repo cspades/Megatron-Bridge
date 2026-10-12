@@ -530,6 +530,7 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
         use_torch_fsdp2: bool = False,
         wrap_with_ddp: bool = True,
         data_parallel_random_init: bool = True,
+        use_layer_wise_distributed_optimizer: bool = False,
         use_cpu_initialization: Optional[bool] = None,
         init_model_with_meta_device: Optional[bool] = None,
         pre_wrap_hook: Optional[
@@ -569,6 +570,7 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
             use_torch_fsdp2: Use PyTorch FSDP2.
             wrap_with_ddp: Whether to wrap model with DDP.
             data_parallel_random_init: Initialize parameters randomly across DP ranks.
+            use_layer_wise_distributed_optimizer: Build shard-aligned DDP layouts for layer-wise optimizers.
             use_cpu_initialization: Initialize model on CPU.
             init_model_with_meta_device: Initialize model on meta device.
             pre_wrap_hook: Callable(s) to modify model before wrapping.
@@ -655,6 +657,7 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
                     megatron_mimo_parallelism_config=self.megatron_mimo_parallelism_config,
                     grids=infra.module_to_grid_map,
                     pg_collections=infra.pg_collections,
+                    use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
                 )
                 for m in model_list
             ]
