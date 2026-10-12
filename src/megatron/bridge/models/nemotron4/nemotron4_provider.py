@@ -392,7 +392,7 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
             module=Nemotron4MIMOLanguageModel,
             params={
                 "config": config,
-                "hybrid_stack_spec": config._resolve_hybrid_stack_spec(),
+                "hybrid_stack_spec": self._language_layer_spec(),
                 "vocab_size": config.vocab_size,
                 "max_sequence_length": config.seq_length,
                 "hybrid_layer_pattern": config.hybrid_layer_pattern,
@@ -411,6 +411,11 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
         language_config = self._copy_config_without_runtime_process_groups(deep=True)
         vision_config = _dense_config(self._build_vision_config(language_config))
         projection_config = _dense_config(self._build_vision_projection_config(language_config))
+        self._apply_vision_recompute_settings(vision_config)
+        for config in (vision_config, projection_config):
+            config.fp8 = None
+            config.fp8_param = False
+            config.quant_recipe = None
         return {
             "images": ModuleSpec(
                 module=VisionModalitySubmodules,
@@ -420,7 +425,7 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
                             module=ViTModel,
                             params={
                                 "transformer_config": vision_config,
-                                "transformer_layer_spec": get_vit_layer_with_transformer_engine_spec(),
+                                "transformer_layer_spec": self._vision_layer_spec(),
                                 "patch_dim": self.patch_dim,
                                 "img_h": self.img_h,
                                 "img_w": self.img_w,

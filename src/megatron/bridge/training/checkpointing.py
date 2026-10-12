@@ -3844,7 +3844,11 @@ def _load_global_dist_base_checkpoint(
     )
     load_strategy = TorchDistLoadShardedStrategy()
     if ckpt_cfg.fully_parallel_load:
-        load_strategy = FullyParallelLoadStrategyWrapper(load_strategy, _checkpoint_dp_cp_group(pg_collection))
+        load_strategy = FullyParallelLoadStrategyWrapper(
+            load_strategy,
+            _checkpoint_dp_cp_group(pg_collection),
+            per_rank_object_load=is_megatron_mimo,
+        )
     if checkpointing_context is not None:
         checkpointing_context["load_strategy"] = load_strategy
     validate_sharding_integrity = True
@@ -3927,6 +3931,7 @@ def _load_base_checkpoint(
                 release=False,
                 checkpoint_path_override=checkpoint_path,
                 checkpointing_context=checkpointing_context,
+                is_megatron_mimo=is_megatron_mimo,
                 pg_collection=pg_collection,
                 cfg=cfg,
             )
