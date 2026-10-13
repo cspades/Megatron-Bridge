@@ -441,7 +441,7 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
                             module=Nemotron4MIMOVisionEncoder,
                             params={
                                 "transformer_config": vision_config,
-                                "transformer_layer_spec": get_vit_layer_with_transformer_engine_spec(),
+                                "transformer_layer_spec": self._vision_layer_spec(),
                                 "patch_dim": self.patch_dim,
                                 "img_h": self.img_h,
                                 "img_w": self.img_w,
