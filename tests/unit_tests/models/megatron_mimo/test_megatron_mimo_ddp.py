@@ -357,3 +357,77 @@ class TestWrapMegatronMIMOModelDistributed:
         assert isinstance(precision_wrapped, Float16Module)
         assert precision_wrapped.module is language_model
         assert language_model.weight.dtype == torch.bfloat16
+
+    @patch("megatron.core.optimizer.layer_wise_optimizer.tag_params_for_buffer_routing")
+    @patch("megatron.core.optimizer.layer_wise_optimizer.LayerWiseDistributedOptimizer")
+    @patch("megatron.core.distributed.DistributedDataParallel")
+    @patch("torch.distributed.get_rank")
+    def test_layer_wise_optimizer_builds_shard_aligned_layouts(
+        self, mock_get_rank, mock_ddp, mock_layer_wise_optimizer, mock_tag_params
+    ):
+        """The layer-wise optimizer (e.g. Muon) gets a shard-aligned DDP layout for every component."""
+        mock_get_rank.return_value = 0
+
+        megatron_mimo_model = self._create_mock_megatron_mimo_model(has_language_model=True, modality_names=["images"])
+        language_model = megatron_mimo_model.language_model
+        images = megatron_mimo_model.modality_submodules["images"]
+        # The layout is built even when the config leaves the distributed optimizer off.
+        ddp_config = MagicMock(
+            use_distributed_optimizer=False, bucket_size=1000, num_buckets=None, overlap_grad_reduce=False
+        )
+        parallelism = self._create_megatron_mimo_parallelism_config({"language": {"dp": 2}, "images": {"dp": 2}})
+        grids = {
+            "language": self._create_mock_grid(rank_offset=0, size=2),
+            "images": self._create_mock_grid(rank_offset=0, size=2),
+        }
+        pg_collections = {"language": MagicMock(), "images": MagicMock()}
+
+        wrap_megatron_mimo_model_distributed(
+            megatron_mimo_model,
+            ddp_config,
+            parallelism,
+            grids,
+            pg_collections,
+            use_layer_wise_distributed_optimizer=True,
+        )
+
+        layout = mock_layer_wise_optimizer.compute_full_param_layout.return_value
+        assert ddp_config.use_distributed_optimizer is True
+        assert [call.args[0] for call in mock_tag_params.call_args_list] == [[language_model], [images]]
+        assert [call.kwargs["module"] for call in mock_ddp.call_args_list] == [language_model, images]
+        assert [call.kwargs["full_param_layout"] for call in mock_ddp.call_args_list] == [layout, layout]
+        assert [call.kwargs["pg_collection"] for call in mock_ddp.call_args_list] == [
+            pg_collections["language"],
+            pg_collections["images"],
+        ]
+
+    @patch("megatron.core.optimizer.layer_wise_optimizer.tag_params_for_buffer_routing")
+    @patch("megatron.core.optimizer.layer_wise_optimizer.LayerWiseDistributedOptimizer")
+    @patch("megatron.core.distributed.DistributedDataParallel")
+    @patch("torch.distributed.get_rank")
+    def test_without_layer_wise_optimizer_keeps_default_ddp_buffers(
+        self, mock_get_rank, mock_ddp, mock_layer_wise_optimizer, mock_tag_params
+    ):
+        """Without the layer-wise optimizer, DDP builds its default buffers and the config is unchanged."""
+        mock_get_rank.return_value = 0
+
+        megatron_mimo_model = self._create_mock_megatron_mimo_model(has_language_model=True, modality_names=["images"])
+        ddp_config = MagicMock(use_distributed_optimizer=False)
+        parallelism = self._create_megatron_mimo_parallelism_config({"language": {"dp": 2}, "images": {"dp": 2}})
+        grids = {
+            "language": self._create_mock_grid(rank_offset=0, size=2),
+            "images": self._create_mock_grid(rank_offset=0, size=2),
+        }
+
+        wrap_megatron_mimo_model_distributed(
+            megatron_mimo_model,
+            ddp_config,
+            parallelism,
+            grids,
+            {"language": MagicMock(), "images": MagicMock()},
+        )
+
+        mock_tag_params.assert_not_called()
+        mock_layer_wise_optimizer.compute_full_param_layout.assert_not_called()
+        assert [call.kwargs["full_param_layout"] for call in mock_ddp.call_args_list] == [None, None]
+        assert ddp_config.use_distributed_optimizer is False
