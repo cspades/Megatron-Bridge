@@ -2201,8 +2201,11 @@ def _mimo_component_wrapper_prefix(
     keys: set[str],
     *,
     module_name: str,
-) -> str:
-    """Return the common component prefix, including runtime wrapper levels."""
+) -> str | None:
+    """Return the common component prefix, including runtime wrapper levels.
+
+    Returns ``None`` when no key belongs to the component.
+    """
     # Keep the experimental MIMO dependency out of ordinary checkpoint imports.
     from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 
@@ -2220,6 +2223,8 @@ def _mimo_component_wrapper_prefix(
             suffix = suffix[len("module.") :]
         depths.add(depth)
 
+    if not depths:
+        return None
     if len(depths) != 1:
         raise RuntimeError(
             f"MIMO component {module_name!r} must have one checkpoint wrapper depth; found {sorted(depths)}."
@@ -2249,11 +2254,21 @@ def _align_mimo_model_sharded_keys(
         set(model_state),
         module_name=module_name,
     )
+    if runtime_prefix is None:
+        return
     checkpoint_metadata = TorchDistLoadShardedStrategy().load_sharded_metadata(Path(checkpoint_name))
     checkpoint_prefix = _mimo_component_wrapper_prefix(
         set(checkpoint_metadata),
         module_name=module_name,
     )
+    if checkpoint_prefix is None:
+        # Leave the runtime keys unmapped so the load's strictness setting handles the missing component.
+        logger.warning(
+            "MIMO checkpoint %s has no keys for component %r; loading it without wrapper prefix mapping",
+            checkpoint_name,
+            module_name,
+        )
+        return
     if runtime_prefix == checkpoint_prefix:
         return
 
