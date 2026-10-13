@@ -137,6 +137,8 @@ def test_bridge_parallel_state_globals_sets_expert_groups_from_pg_collection():
         "_TENSOR_MODEL_PARALLEL_GROUP",
         "_DATA_PARALLEL_GROUP",
         "_DATA_PARALLEL_GROUP_WITH_CP",
+        "_TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP",
+        "_TENSOR_AND_CONTEXT_PARALLEL_GROUP",
         "_PIPELINE_MODEL_PARALLEL_GROUP",
         "_EXPERT_MODEL_PARALLEL_GROUP",
         "_EXPERT_TENSOR_PARALLEL_GROUP",
@@ -155,6 +157,8 @@ def test_bridge_parallel_state_globals_sets_expert_groups_from_pg_collection():
             "tp",
             "dp",
             "dp_cp",
+            "tp_dp_cp",
+            "tp_cp",
             "pp",
             "ep",
             "expt_tp",
@@ -174,6 +178,8 @@ def test_bridge_parallel_state_globals_sets_expert_groups_from_pg_collection():
         assert mpu._TENSOR_MODEL_PARALLEL_GROUP is groups["tp"]
         assert mpu._DATA_PARALLEL_GROUP is groups["dp"]
         assert mpu._DATA_PARALLEL_GROUP_WITH_CP is groups["dp_cp"]
+        assert mpu._TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP is groups["tp_dp_cp"]
+        assert mpu._TENSOR_AND_CONTEXT_PARALLEL_GROUP is groups["tp_cp"]
         assert mpu._PIPELINE_MODEL_PARALLEL_GROUP is groups["pp"]
         assert mpu._EXPERT_MODEL_PARALLEL_GROUP is groups["ep"]
         assert mpu._EXPERT_TENSOR_PARALLEL_GROUP is groups["expt_tp"]
@@ -380,3 +386,7 @@ def test_setup_megatron_mimo_asserts_when_constructor_fields_missing(
 
     mock_build_model.assert_called_once()
     assert mock_build_model.call_args.kwargs["seed"] == cfg.rng.seed
+    assert (
+        mock_build_model.call_args.kwargs["use_layer_wise_distributed_optimizer"]
+        is cfg.optimizer.use_layer_wise_distributed_optimizer
+    )

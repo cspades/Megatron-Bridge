@@ -33,6 +33,54 @@ def _provider_with_recompute(**overrides):
     return provider
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize("builder", ["_build_vision_config", "_build_vision_projection_config"])
+def test_dense_configs_clear_language_controls_without_changing_language(builder: str) -> None:
+    provider = Nemotron4VLModelProvider(
+        hybrid_layer_pattern="M-*E",
+        hidden_size=128,
+        ffn_hidden_size=256,
+        num_attention_heads=4,
+        kv_channels=32,
+        vocab_size=128,
+        num_moe_experts=4,
+        moe_router_topk=2,
+        moe_ffn_hidden_size=128,
+        moe_grouped_gemm=True,
+        moe_use_grouped_tensor=True,
+        use_transformer_engine_op_fuser=True,
+        fp8="e4m3",
+        fp8_recipe="mxfp8",
+        fp8_param=True,
+        first_last_layers_bf16=True,
+        num_layers_at_start_in_bf16=2,
+        num_layers_at_end_in_bf16=4,
+        vision_num_layers=1,
+        vision_hidden_size=64,
+        vision_ffn_hidden_size=128,
+        vision_num_attention_heads=4,
+        vision_kv_channels=16,
+    )
+    language_config = provider._copy_config_without_runtime_process_groups(deep=True)
+
+    dense_config = nm4_provider._dense_config(getattr(provider, builder)(language_config))
+
+    assert dense_config.num_moe_experts is None
+    assert not dense_config.moe_grouped_gemm
+    assert not dense_config.moe_use_grouped_tensor
+    assert language_config.moe_grouped_gemm
+    assert language_config.moe_use_grouped_tensor
+    assert provider.moe_grouped_gemm
+    assert provider.moe_use_grouped_tensor
+    assert not dense_config.first_last_layers_bf16
+    assert dense_config.num_layers_at_start_in_bf16 == 0
+    assert dense_config.num_layers_at_end_in_bf16 == 0
+    for config in (provider, language_config):
+        assert config.first_last_layers_bf16
+        assert config.num_layers_at_start_in_bf16 == 2
+        assert config.num_layers_at_end_in_bf16 == 4
+
+
 def test_provider_exposes_vision_recompute_fields():
     field_names = {field.name for field in fields(Nemotron4VLModelProvider)}
 
@@ -65,6 +113,33 @@ def test_provider_rejects_incomplete_vision_recompute():
 
     with pytest.raises(ValueError, match="Vision recompute requires"):
         provider._apply_vision_recompute_settings(SimpleNamespace())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("provider_field", "config_field", "other_config_field"),
+    [
+        ("vision_bias_activation_fusion", "bias_activation_fusion", "apply_rope_fusion"),
+        ("vision_apply_rope_fusion", "apply_rope_fusion", "bias_activation_fusion"),
+    ],
+)
+def test_provider_applies_requested_vision_fusion(provider_field, config_field, other_config_field):
+    defaults = {field.name: field.default for field in fields(Nemotron4VLModelProvider)}
+    assert defaults[provider_field] is False
+    provider = object.__new__(Nemotron4VLModelProvider)
+    for name, default in defaults.items():
+        if name.startswith("vision_"):
+            setattr(provider, name, default)
+    setattr(provider, provider_field, True)
+
+    with (
+        patch.object(nm4_provider, "_make_dense_non_hybrid"),
+        patch.object(nm4_provider, "_make_replicated_single_stage"),
+    ):
+        vision_cfg = provider._build_vision_config(SimpleNamespace())
+
+    assert getattr(vision_cfg, config_field) is True
+    assert getattr(vision_cfg, other_config_field) is False
 
 
 @pytest.mark.unit

@@ -7,6 +7,7 @@ import torch.distributed as dist
 from megatron.core import parallel_state as mpu
 from megatron.core.transformer.spec_utils import ModuleSpec
 
+from megatron.bridge.models.megatron_mimo import build_model
 from megatron.bridge.models.megatron_mimo.build_model import _bridge_parallel_state_globals, build_megatron_mimo_model
 from megatron.bridge.models.megatron_mimo.megatron_mimo_builder import build_hypercomm_grids
 from megatron.bridge.models.megatron_mimo.megatron_mimo_config import (
@@ -21,6 +22,8 @@ def test_bridge_parallel_state_uses_mcore_expert_group_fields(monkeypatch):
         tp=object(),
         dp=object(),
         dp_cp=object(),
+        tp_dp_cp=object(),
+        tp_cp=object(),
         pp=object(),
         ep=object(),
         expt_tp=object(),
@@ -34,6 +37,8 @@ def test_bridge_parallel_state_uses_mcore_expert_group_fields(monkeypatch):
         "_TENSOR_MODEL_PARALLEL_GROUP",
         "_DATA_PARALLEL_GROUP",
         "_DATA_PARALLEL_GROUP_WITH_CP",
+        "_TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP",
+        "_TENSOR_AND_CONTEXT_PARALLEL_GROUP",
         "_PIPELINE_MODEL_PARALLEL_GROUP",
         "_EXPERT_MODEL_PARALLEL_GROUP",
         "_EXPERT_TENSOR_PARALLEL_GROUP",
@@ -48,6 +53,8 @@ def test_bridge_parallel_state_uses_mcore_expert_group_fields(monkeypatch):
 
     _bridge_parallel_state_globals(groups)
 
+    assert mpu._TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP is groups.tp_dp_cp
+    assert mpu._TENSOR_AND_CONTEXT_PARALLEL_GROUP is groups.tp_cp
     assert mpu._EXPERT_MODEL_PARALLEL_GROUP is groups.ep
     assert mpu._EXPERT_TENSOR_PARALLEL_GROUP is groups.expt_tp
     assert mpu._EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP is groups.tp_ep
@@ -89,3 +96,24 @@ def test_build_megatron_mimo_model_creates_process_groups_once(monkeypatch):
     assert mimo_config.module_to_grid_map is infra.module_to_grid_map
     assert mimo_config.language_model_spec.params["pg_collection"] is infra.pg_collections["language"]
     assert mock_wrap_ddp.call_args.kwargs["pg_collections"] is infra.pg_collections
+
+
+def test_build_model_forwards_layer_wise_optimizer_flag(monkeypatch):
+    provider = MagicMock()
+    provider.provide_distributed_model.return_value = [MagicMock()]
+    monkeypatch.setattr(build_model, "dist", MagicMock())
+    monkeypatch.setattr(build_model, "_set_per_module_random_seeds", MagicMock())
+    monkeypatch.setattr(build_model, "_bridge_parallel_state_globals", MagicMock())
+
+    with (
+        patch("megatron.bridge.training.megatron_mimo_parallel_utils.validate_no_stub_ranks"),
+        patch(
+            "megatron.bridge.training.megatron_mimo_parallel_utils.get_active_module_pg",
+            return_value=("language", MagicMock()),
+        ),
+    ):
+        build_model.build_megatron_mimo_model(
+            provider, ddp_config=MagicMock(), use_layer_wise_distributed_optimizer=True
+        )
+
+    assert provider.provide_distributed_model.call_args.kwargs["use_layer_wise_distributed_optimizer"] is True
