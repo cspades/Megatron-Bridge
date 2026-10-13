@@ -141,7 +141,43 @@ def _build_vision_packed_seq_params(imgs_sizes: torch.Tensor, patch_dim: int, de
     )
 
 
-class Nemotron4MIMOLanguageModel(HybridModel):
+class _WithoutTEExtraState:
+    """Exclude TE metadata absent from the native NM4 checkpoints, as :class:`Nemotron4VLModel` does."""
+
+    def sharded_state_dict(self, *args, **kwargs) -> ShardedStateDict:
+        from megatron.bridge.training.checkpointing import delete_extra_state
+
+        state = super().sharded_state_dict(*args, **kwargs)
+        delete_extra_state(state)
+        return state
+
+
+class Nemotron4MIMOVisionEncoder(_WithoutTEExtraState, ViTModel):
+    """Pixtral-style ViT of the MIMO ``images`` module."""
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        imgs_sizes: torch.Tensor,
+        packed_seq_params: PackedSeqParams,
+        num_frames: torch.Tensor | None = None,
+        expected_output_counts: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Encode the MIMO packed-image payload, one ``imgs_sizes`` row per image.
+
+        Images have one frame, so ``num_frames`` is not used. The media balancer checks the
+        output rows against ``expected_output_counts``.
+        """
+        del num_frames, expected_output_counts
+        # The ViT reads the patch grid on the host; MIMO payloads carry it on the GPU.
+        return super().forward(x, imgs_sizes=imgs_sizes.cpu(), packed_seq_params=packed_seq_params)
+
+
+class Nemotron4MIMOProjector(_WithoutTEExtraState, MultimodalProjector):
+    """Vision projector of the MIMO ``images`` module."""
+
+
+class Nemotron4MIMOLanguageModel(_WithoutTEExtraState, HybridModel):
     """Hybrid decoder retaining Nemotron4's FP32 state during MIMO dtype casts.
 
     MIMO calls ``bfloat16()`` on the complete model. The residual controllers,

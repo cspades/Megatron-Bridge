@@ -5,10 +5,17 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.models.vision.multimodal_projector import MultimodalProjector
+from megatron.core.models.vision.vit_model import ViTModel
+from megatron.core.packed_seq_params import PackedSeqParams
 
 
 if importlib.util.find_spec("megatron.core.models.hybrid.shortcut_block") is None:
     pytest.skip("Nemotron4 requires its MCore fork", allow_module_level=True)
+
+from megatron.core.models.mimo.submodules.encoder_dp_media_balancer import EncoderDPMediaBalancedVisionSubmodules
+from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 
 from megatron.bridge.models.megatron_mimo.conversion import (
     build_route_local_registry,
@@ -20,7 +27,12 @@ from megatron.bridge.models.megatron_mimo.megatron_mimo_config import (
     ModuleParallelismConfig,
 )
 from megatron.bridge.models.nemotron4 import Nemotron4Bridge, Nemotron4VLModelProvider
-from megatron.bridge.models.nemotron4.modeling_nemotron4_vl import Nemotron4MIMOLanguageModel
+from megatron.bridge.models.nemotron4.modeling_nemotron4_vl import (
+    Nemotron4GatedDeltaProductMixer,
+    Nemotron4MIMOLanguageModel,
+    Nemotron4MIMOProjector,
+    Nemotron4MIMOVisionEncoder,
+)
 from megatron.bridge.models.nemotron4.nemotron4_bridge import nemotron4_mimo_conversion_spec
 
 
@@ -62,8 +74,8 @@ def _parallelism(**image_kwargs):
     )
 
 
-def _source(monkeypatch, mtp_depths):
-    provider = Nemotron4VLModelProvider(
+def _provider(mtp_depths=0, **overrides):
+    return Nemotron4VLModelProvider(
         hybrid_layer_pattern="M-*EME" + "/*E" * mtp_depths,
         hidden_size=128,
         ffn_hidden_size=256,
@@ -83,7 +95,12 @@ def _source(monkeypatch, mtp_depths):
         vision_ffn_hidden_size=128,
         vision_num_attention_heads=4,
         vision_kv_channels=16,
+        **overrides,
     )
+
+
+def _source(monkeypatch, mtp_depths):
+    provider = _provider(mtp_depths)
     config = SimpleNamespace(
         torch_dtype=torch.bfloat16,
         text_config=SimpleNamespace(
@@ -182,3 +199,95 @@ def test_export_restores_fp32_for_hf_strict_fp32_state(monkeypatch):
 def test_export_copies_processor_config_from_source():
     """OpenCV-free environments cannot instantiate the Nemotron4 processor; copy its config."""
     assert "processor_config.json" in Nemotron4Bridge.ADDITIONAL_FILE_PATTERNS
+
+
+def test_training_specs_use_the_mimo_components_bf16_encoder_and_vision_recompute():
+    provider = _provider(
+        fp8="e4m3",
+        fp8_recipe="mxfp8",
+        fp8_param=True,
+        recompute_vision=True,
+        vision_recompute_granularity="full",
+        vision_recompute_method="block",
+        vision_recompute_num_layers=1,
+    )
+    images = provider.build_mimo_modality_submodules_spec()["images"]
+    encoder = images.submodules["encoders"]["pixtral"]
+    (projector,) = images.submodules["input_projections"]
+    assert (images.module, images.params) == (VisionModalitySubmodules, {})
+    assert encoder.module is Nemotron4MIMOVisionEncoder
+    assert projector.module is Nemotron4MIMOProjector
+    vision = encoder.params["transformer_config"]
+    for config in (vision, projector.params["config"]):
+        assert (config.fp8, config.fp8_param, config.quant_recipe) == (None, False, None)
+    assert (vision.recompute_granularity, vision.recompute_method, vision.recompute_num_layers) == ("full", "block", 1)
+
+
+def test_language_spec_uses_the_saved_spec_with_the_stride_safe_gdp_mixer():
+    """NM4 run configs store hybrid_stack_spec: null; the checkpoint's saved spec names the GDP stack."""
+    provider = _provider(hybrid_stack_spec=None)
+    provider._saved_args = SimpleNamespace(
+        spec=("megatron.core.models.hybrid.hybrid_layer_specs", "gated_delta_product_stack_spec")
+    )
+    language = provider.build_language_model_spec()
+    mixer = language.params["hybrid_stack_spec"].submodules.mamba_layer.submodules.mixer
+    assert mixer.module is Nemotron4GatedDeltaProductMixer
+
+
+def test_images_module_balances_media_on_request():
+    provider = _provider(mimo_encoder_dp_media_balance=True)
+    images = provider.build_mimo_modality_submodules_spec()["images"]
+    assert images.module is EncoderDPMediaBalancedVisionSubmodules
+    assert images.params == {
+        "encoder_name": "pixtral",
+        "frame_weight": 165,
+        "language_hidden_size": 128,
+        "pixel_dtype": provider.params_dtype,
+        "patch_dim": 14,
+        "temporal_patch_size": 1,
+    }
+
+
+def test_vision_encoder_takes_the_mimo_payload(monkeypatch):
+    received = {}
+
+    def vit_forward(self, pixel_values, attention_mask=None, imgs_sizes=None, packed_seq_params=None):
+        received.update(pixel_values=pixel_values, imgs_sizes=imgs_sizes, packed_seq_params=packed_seq_params)
+        return pixel_values
+
+    monkeypatch.setattr(ViTModel, "forward", vit_forward)
+    encoder = object.__new__(Nemotron4MIMOVisionEncoder)
+    torch.nn.Module.__init__(encoder)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    x = torch.zeros(1, 8, 588, device=device)
+    imgs_sizes = torch.tensor([[28, 28], [28, 28]], dtype=torch.int32, device=device)
+    packed_seq_params = PackedSeqParams(qkv_format="thd")
+    ones = torch.ones(2, dtype=torch.int32, device=device)
+
+    encoder(
+        x=x,
+        imgs_sizes=imgs_sizes,
+        num_frames=ones,
+        expected_output_counts=ones,
+        packed_seq_params=packed_seq_params,
+    )
+
+    assert received["pixel_values"] is x
+    assert received["imgs_sizes"].device.type == "cpu"
+    assert torch.equal(received["imgs_sizes"], imgs_sizes.cpu())
+    assert received["packed_seq_params"] is packed_seq_params
+
+
+@pytest.mark.parametrize(
+    "component,parent",
+    [
+        (Nemotron4MIMOLanguageModel, HybridModel),
+        (Nemotron4MIMOProjector, MultimodalProjector),
+        (Nemotron4MIMOVisionEncoder, ViTModel),
+    ],
+)
+def test_components_omit_te_extra_state(monkeypatch, component, parent):
+    state = {"linear.weight": object(), "linear._extra_state": object()}
+    monkeypatch.setattr(parent, "sharded_state_dict", lambda self, *args, **kwargs: dict(state))
+
+    assert object.__new__(component).sharded_state_dict(prefix="") == {"linear.weight": state["linear.weight"]}
