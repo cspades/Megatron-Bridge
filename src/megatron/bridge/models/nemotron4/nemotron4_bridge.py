@@ -81,6 +81,7 @@ _LAYER_TYPE_TO_PATTERN = {
     "mlp": "-",
     "shortcut_moe_attn": "*E",
     "shortcut_moe_gdp": "ME",
+    "full_attention": "*",
 }
 
 # Synthesized HF name prefix for Megatron-only state; never present in an HF checkpoint.
@@ -458,6 +459,13 @@ class Nemotron4Bridge(MegatronModelBridge):
             AutoMapping(f"{L}.mlp.linear_fc1.weight", f"{HL}.mlp.up_proj.weight"),
             AutoMapping(f"{L}.mlp.linear_fc2.weight", f"{HL}.mlp.down_proj.weight"),
             *controllers(f"{L}.residual_connection_mlp", f"{HL}.residual_connection"),
+        ]
+
+        # Standalone attention (full_attention) layers. Listed after the shortcut blocks so
+        # ``compute_layer`` names keep resolving to the shortcut attention mappings above.
+        mappings += [
+            *attention(L, HL),
+            *controllers(f"{L}.residual_connection_self_attn", f"{HL}.residual_connection"),
         ]
 
         # Multi-token prediction.
