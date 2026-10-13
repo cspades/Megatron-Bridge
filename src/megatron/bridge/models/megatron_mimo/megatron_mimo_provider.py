@@ -137,8 +137,8 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
         >>> # For training loop integration:
         >>> model = provider.provide_distributed_model(ddp_config=ddp_config)
         >>> # Or for manual usage:
-        >>> model = provider.provide()
         >>> infra = provider.build_infra()
+        >>> model = provider.provide(infra=infra)
     """
 
     # Durable input state for conversion-generated providers. Derived specs are
@@ -265,8 +265,9 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
         """Build MegatronMIMO parallelism infrastructure.
 
         This method builds HyperCommGrids, ProcessGroupCollections, and topology
-        for MegatronMIMO's heterogeneous parallelism. It is idempotent and does not
-        mutate provider state (results are not cached).
+        for MegatronMIMO's heterogeneous parallelism. Each call creates new process
+        groups and replaces ``_grids``, so build once and pass the result to
+        provide() or provide_distributed_model().
 
         Can be called before or after provide(). Call finalize() first to
         validate the parallelism configuration.
@@ -435,17 +436,21 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
         pre_process: Optional[bool] = None,
         post_process: Optional[bool] = None,
         vp_stage: Optional[int] = None,
+        *,
+        infra: MegatronMIMOInfra | None = None,
     ) -> MimoModel:
         """Build and return the MimoModel instance.
 
         This method follows the standard ModelProviderMixin.provide() contract,
         returning only the model instance. For infrastructure metadata (grids,
-        topology, pg_collections), use build_infra() separately.
+        topology, pg_collections), build it once with build_infra() and pass it
+        as ``infra``.
 
         Args:
             pre_process: Unused for MegatronMIMO (accepted for API compatibility).
             post_process: Unused for MegatronMIMO (accepted for API compatibility).
             vp_stage: Unused for MegatronMIMO (accepted for API compatibility).
+            infra: Infra from build_infra() to use. Built if None.
 
         Returns:
             MimoModel instance.
@@ -465,7 +470,8 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
             )
 
         # Build infrastructure
-        infra = self.build_infra()
+        if infra is None:
+            infra = self.build_infra()
 
         # Inject pg_collection into language model spec
         language_spec = self.language_model_spec
@@ -526,6 +532,7 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
         use_torch_fsdp2: bool = False,
         wrap_with_ddp: bool = True,
         data_parallel_random_init: bool = True,
+        use_layer_wise_distributed_optimizer: bool = False,
         use_cpu_initialization: Optional[bool] = None,
         init_model_with_meta_device: Optional[bool] = None,
         pre_wrap_hook: Optional[
@@ -535,6 +542,8 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
             ]
         ] = None,
         post_wrap_hook: Optional[Callable[[List[MegatronModule]], List[MegatronModule]]] = None,
+        *,
+        infra: MegatronMIMOInfra | None = None,
     ) -> List[MegatronModule]:
         """Build MegatronMIMO model with heterogeneous parallelism and DDP wrapping.
 
@@ -546,8 +555,8 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
 
         The method:
         1. Calls finalize() to validate parallelism config
-        2. Calls build_infra() to create grids and pg_collections
-        3. Calls provide() to build the model
+        2. Calls build_infra() to create grids and pg_collections, unless ``infra`` is given
+        3. Calls provide() to build the model with the same infra
         4. Applies pre-wrap hooks
         5. Moves to device
         6. Casts to fp16/bf16
@@ -564,10 +573,12 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
             use_torch_fsdp2: Use PyTorch FSDP2.
             wrap_with_ddp: Whether to wrap model with DDP.
             data_parallel_random_init: Initialize parameters randomly across DP ranks.
+            use_layer_wise_distributed_optimizer: Build shard-aligned DDP layouts for layer-wise optimizers.
             use_cpu_initialization: Initialize model on CPU.
             init_model_with_meta_device: Initialize model on meta device.
             pre_wrap_hook: Callable(s) to modify model before wrapping.
             post_wrap_hook: Callable to modify model after wrapping.
+            infra: Infra from build_infra() to use. Built if None.
 
         Returns:
             List containing the wrapped MimoModel.
@@ -588,10 +599,11 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
         self.finalize()
 
         # Build infrastructure
-        infra = self.build_infra()
+        if infra is None:
+            infra = self.build_infra()
 
         # Get the model
-        model = self.provide()
+        model = self.provide(infra=infra)
         model_list = [model]
 
         # Resolve hooks
@@ -648,6 +660,7 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
                     megatron_mimo_parallelism_config=self.megatron_mimo_parallelism_config,
                     grids=infra.module_to_grid_map,
                     pg_collections=infra.pg_collections,
+                    use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
                 )
                 for m in model_list
             ]

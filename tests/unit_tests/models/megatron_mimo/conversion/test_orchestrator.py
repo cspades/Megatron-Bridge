@@ -251,11 +251,11 @@ class TestComponentPgContext:
 
         ``MegatronMIMOProvider`` injects per-rank pg_collection into specs at
         construction time, so the constructed submodule already carries the
-        correct groups. ``build_infra`` produces fresh ``ProcessGroupCollection``
-        instances on each call, so the orchestrator's pg_collections map
-        won't compare equal to what's already on the module. The context
-        manager therefore trusts the existing attachment and never
-        overwrites it.
+        correct groups. ``build_megatron_mimo_model`` builds the model from the
+        infra it returns, so the orchestrator's pg_collections are those same
+        objects; an infra from a separate ``build_infra`` call holds different
+        ones. Either way, the context manager trusts the existing attachment
+        and never overwrites it.
         """
         module = nn.Linear(4, 4)
         existing = _PgCollection("language")
