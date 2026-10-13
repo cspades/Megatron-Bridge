@@ -365,6 +365,12 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
     vision_recompute_granularity: Literal["full", "selective"] | None = None
     vision_recompute_method: Literal["uniform", "block"] | None = None
     vision_recompute_num_layers: int | None = None
+    vision_bias_activation_fusion: bool = False
+    """Run the ViT SwiGLU as one fused kernel (Core ``bias_swiglu_impl``) instead of unfused ops."""
+    vision_apply_rope_fusion: bool = False
+    """Apply the ViT 2D RoPE with Transformer Engine's fused kernel. Needs a Megatron Core whose fused RoPE
+    applies per-token frequencies of packed inputs; with an older Core, packed images get wrong angles and no
+    error is raised."""
 
     # --- legacy native-checkpoint hydration (non-MIMO checkpoints converted from the fork) ---
     checkpoint_path: str = ""
@@ -477,10 +483,10 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
         vision_cfg.hidden_dropout = 0.0
         vision_cfg.attention_dropout = 0.0
         vision_cfg.layernorm_zero_centered_gamma = False
-        vision_cfg.bias_activation_fusion = False
+        vision_cfg.bias_activation_fusion = self.vision_bias_activation_fusion
         vision_cfg.bias_dropout_fusion = False
         vision_cfg.attention_softmax_in_fp32 = True
-        vision_cfg.apply_rope_fusion = False
+        vision_cfg.apply_rope_fusion = self.vision_apply_rope_fusion
         _make_dense_non_hybrid(vision_cfg)
         _make_replicated_single_stage(vision_cfg)
         return vision_cfg

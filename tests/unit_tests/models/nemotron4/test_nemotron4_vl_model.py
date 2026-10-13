@@ -68,6 +68,33 @@ def test_provider_rejects_incomplete_vision_recompute():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("provider_field", "config_field", "other_config_field"),
+    [
+        ("vision_bias_activation_fusion", "bias_activation_fusion", "apply_rope_fusion"),
+        ("vision_apply_rope_fusion", "apply_rope_fusion", "bias_activation_fusion"),
+    ],
+)
+def test_provider_applies_requested_vision_fusion(provider_field, config_field, other_config_field):
+    defaults = {field.name: field.default for field in fields(Nemotron4VLModelProvider)}
+    assert defaults[provider_field] is False
+    provider = object.__new__(Nemotron4VLModelProvider)
+    for name, default in defaults.items():
+        if name.startswith("vision_"):
+            setattr(provider, name, default)
+    setattr(provider, provider_field, True)
+
+    with (
+        patch.object(nm4_provider, "_make_dense_non_hybrid"),
+        patch.object(nm4_provider, "_make_replicated_single_stage"),
+    ):
+        vision_cfg = provider._build_vision_config(SimpleNamespace())
+
+    assert getattr(vision_cfg, config_field) is True
+    assert getattr(vision_cfg, other_config_field) is False
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("cp_size", [1, 2])
 @pytest.mark.parametrize("vision_dp_over_cp", [False, True])
 @pytest.mark.parametrize("gtp_size", [1, 2])
