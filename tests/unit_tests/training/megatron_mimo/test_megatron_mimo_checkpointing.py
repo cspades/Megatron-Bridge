@@ -11,6 +11,7 @@ from __future__ import annotations
 import inspect
 import time
 from contextlib import ExitStack
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict
 from unittest.mock import MagicMock, Mock, call, patch
@@ -21,6 +22,74 @@ import pytest
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def test_mimo_checkpoint_load_maps_runtime_wrapper_depth_to_stored_depth():
+    """MIMO loads preserve runtime keys while looking up stored wrapper keys."""
+    from megatron.bridge.training.checkpointing import _align_mimo_model_sharded_keys
+
+    model_state = {"language_model.module.weight": object()}
+    sharded_state = {"model": model_state}
+    checkpoint_metadata = {"language_model.module.module.weight": object()}
+
+    with (
+        patch("megatron.bridge.training.checkpointing.TorchDistLoadShardedStrategy") as load_strategy,
+        patch("megatron.bridge.training.checkpointing.apply_prefix_mapping") as apply_mapping,
+    ):
+        load_strategy.return_value.load_sharded_metadata.return_value = checkpoint_metadata
+        _align_mimo_model_sharded_keys(
+            sharded_state,
+            checkpoint_name="/checkpoint",
+            module_name="language",
+        )
+
+    apply_mapping.assert_called_once_with(
+        model_state,
+        {"language_model.module.": "language_model.module.module."},
+    )
+    load_strategy.return_value.load_sharded_metadata.assert_called_once_with(Path("/checkpoint"))
+
+
+def test_mimo_checkpoint_load_leaves_keys_unmapped_when_checkpoint_lacks_component():
+    """A checkpoint without the component's keys is left to the load's strictness setting."""
+    from megatron.bridge.training.checkpointing import _align_mimo_model_sharded_keys
+
+    model_state = {"modality_submodules.images.module.weight": object()}
+    sharded_state = {"model": model_state}
+    checkpoint_metadata = {"language_model.module.module.weight": object()}
+
+    with (
+        patch("megatron.bridge.training.checkpointing.TorchDistLoadShardedStrategy") as load_strategy,
+        patch("megatron.bridge.training.checkpointing.apply_prefix_mapping") as apply_mapping,
+    ):
+        load_strategy.return_value.load_sharded_metadata.return_value = checkpoint_metadata
+        _align_mimo_model_sharded_keys(
+            sharded_state,
+            checkpoint_name="/checkpoint",
+            module_name="images",
+        )
+
+    apply_mapping.assert_not_called()
+
+
+def test_mimo_checkpoint_load_rejects_mixed_wrapper_depths():
+    """A component stored at more than one wrapper depth cannot be mapped."""
+    from megatron.bridge.training.checkpointing import _align_mimo_model_sharded_keys
+
+    sharded_state = {"model": {"language_model.module.weight": object()}}
+    checkpoint_metadata = {
+        "language_model.module.weight": object(),
+        "language_model.module.module.bias": object(),
+    }
+
+    with patch("megatron.bridge.training.checkpointing.TorchDistLoadShardedStrategy") as load_strategy:
+        load_strategy.return_value.load_sharded_metadata.return_value = checkpoint_metadata
+        with pytest.raises(RuntimeError, match="must have one checkpoint wrapper depth"):
+            _align_mimo_model_sharded_keys(
+                sharded_state,
+                checkpoint_name="/checkpoint",
+                module_name="language",
+            )
 
 
 def _make_scheduler_mock() -> MagicMock:
