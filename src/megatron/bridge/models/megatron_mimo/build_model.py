@@ -78,6 +78,7 @@ def build_megatron_mimo_model(
         wrap_with_ddp=wrap_with_ddp,
         data_parallel_random_init=data_parallel_random_init,
         use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
+        infra=infra,
     )
     mimo_model = model_list[0]
 
