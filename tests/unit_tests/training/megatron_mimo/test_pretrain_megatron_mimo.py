@@ -380,3 +380,7 @@ def test_setup_megatron_mimo_asserts_when_constructor_fields_missing(
 
     mock_build_model.assert_called_once()
     assert mock_build_model.call_args.kwargs["seed"] == cfg.rng.seed
+    assert (
+        mock_build_model.call_args.kwargs["use_layer_wise_distributed_optimizer"]
+        is cfg.optimizer.use_layer_wise_distributed_optimizer
+    )

@@ -696,6 +696,46 @@ class TestMegatronMIMOTraining:
         )
 
     @pytest.mark.run_only_on("GPU")
+    def test_megatron_mimo_muon_layer_wise_tp1_both(self):
+        """MegatronMIMO trains with Muon and the layer-wise distributed optimizer."""
+        initialize_distributed()
+
+        world_size = dist.get_world_size()
+        if world_size != 2:
+            pytest.skip(f"MegatronMIMO test requires exactly 2 GPUs, got {world_size}")
+
+        import megatron.bridge.training.utils.train_utils as _tu
+
+        _tu.report_theoretical_memory = lambda *a, **kw: None
+
+        par_cfg = MegatronMIMOParallelismConfig(
+            module_parallelisms={
+                "language": ModuleParallelismConfig(
+                    tensor_model_parallel_size=1,
+                    pipeline_model_parallel_size=1,
+                    data_parallel_size=1,
+                    rank_offset=0,
+                ),
+                "vision": ModuleParallelismConfig(
+                    tensor_model_parallel_size=1,
+                    pipeline_model_parallel_size=1,
+                    data_parallel_size=1,
+                    rank_offset=1,
+                ),
+            },
+        )
+
+        cfg = _build_config(par_cfg, train_iters=2)
+        cfg.optimizer.optimizer = "muon"
+        cfg.optimizer.use_layer_wise_distributed_optimizer = True
+
+        pretrain_megatron_mimo(
+            cfg=cfg,
+            forward_step_func=megatron_mimo_forward_step,
+            build_data_iterators_fn=_build_data_iterators,
+        )
+
+    @pytest.mark.run_only_on("GPU")
     @pytest.mark.parametrize("save_rng", [True, False], ids=["save_rng", "no_save_rng"])
     def test_megatron_mimo_checkpoint_resume_dp1_both(self, tmp_path, save_rng):
         """Fast checkpoint-resume check (issue #11 regression guard).

@@ -7,6 +7,7 @@ import torch.distributed as dist
 from megatron.core import parallel_state as mpu
 from megatron.core.transformer.spec_utils import ModuleSpec
 
+from megatron.bridge.models.megatron_mimo import build_model
 from megatron.bridge.models.megatron_mimo.build_model import _bridge_parallel_state_globals, build_megatron_mimo_model
 from megatron.bridge.models.megatron_mimo.megatron_mimo_builder import build_hypercomm_grids
 from megatron.bridge.models.megatron_mimo.megatron_mimo_config import (
@@ -89,3 +90,24 @@ def test_build_megatron_mimo_model_creates_process_groups_once(monkeypatch):
     assert mimo_config.module_to_grid_map is infra.module_to_grid_map
     assert mimo_config.language_model_spec.params["pg_collection"] is infra.pg_collections["language"]
     assert mock_wrap_ddp.call_args.kwargs["pg_collections"] is infra.pg_collections
+
+
+def test_build_model_forwards_layer_wise_optimizer_flag(monkeypatch):
+    provider = MagicMock()
+    provider.provide_distributed_model.return_value = [MagicMock()]
+    monkeypatch.setattr(build_model, "dist", MagicMock())
+    monkeypatch.setattr(build_model, "_set_per_module_random_seeds", MagicMock())
+    monkeypatch.setattr(build_model, "_bridge_parallel_state_globals", MagicMock())
+
+    with (
+        patch("megatron.bridge.training.megatron_mimo_parallel_utils.validate_no_stub_ranks"),
+        patch(
+            "megatron.bridge.training.megatron_mimo_parallel_utils.get_active_module_pg",
+            return_value=("language", MagicMock()),
+        ),
+    ):
+        build_model.build_megatron_mimo_model(
+            provider, ddp_config=MagicMock(), use_layer_wise_distributed_optimizer=True
+        )
+
+    assert provider.provide_distributed_model.call_args.kwargs["use_layer_wise_distributed_optimizer"] is True

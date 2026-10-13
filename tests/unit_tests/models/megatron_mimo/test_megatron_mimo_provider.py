@@ -537,6 +537,31 @@ class TestMegatronMIMOProvider:
         # Should have set variable_seq_lengths=True
         assert mock_config.variable_seq_lengths is True
 
+    @patch("megatron.bridge.models.megatron_mimo.megatron_mimo_provider.wrap_megatron_mimo_model_distributed")
+    @patch("megatron.bridge.models.megatron_mimo.megatron_mimo_provider.get_model_config")
+    def test_provide_distributed_model_forwards_layer_wise_optimizer_flag(self, _mock_get_config, mock_wrap):
+        """The per-module DDP wrap must know that the layer-wise optimizer is used."""
+        provider = MegatronMIMOProvider(
+            language_model_spec=ModuleSpec(module=Mock, params={"config": Mock()}),
+            megatron_mimo_parallelism_config=MegatronMIMOParallelismConfig(
+                module_parallelisms={"language": ModuleParallelismConfig(data_parallel_size=1)},
+            ),
+            bf16=False,
+            use_cpu_initialization=True,
+        )
+        ddp_config = MagicMock()
+
+        with (
+            patch.object(provider, "finalize"),
+            patch.object(provider, "build_infra"),
+            patch.object(provider, "provide", return_value=MagicMock()),
+        ):
+            provider.provide_distributed_model(ddp_config=ddp_config, use_layer_wise_distributed_optimizer=True)
+
+        mock_wrap.assert_called_once()
+        assert mock_wrap.call_args.kwargs["ddp_config"] is ddp_config
+        assert mock_wrap.call_args.kwargs["use_layer_wise_distributed_optimizer"] is True
+
 
 class TestMegatronMIMOInfra:
     """Test cases for MegatronMIMOInfra dataclass."""
