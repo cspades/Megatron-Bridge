@@ -2201,8 +2201,11 @@ def _mimo_component_wrapper_prefix(
     keys: set[str],
     *,
     module_name: str,
-) -> str:
-    """Return the common component prefix, including runtime wrapper levels."""
+) -> str | None:
+    """Return the common component prefix, including runtime wrapper levels.
+
+    Returns ``None`` when no key belongs to the component.
+    """
     # Keep the experimental MIMO dependency out of ordinary checkpoint imports.
     from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 
@@ -2220,6 +2223,8 @@ def _mimo_component_wrapper_prefix(
             suffix = suffix[len("module.") :]
         depths.add(depth)
 
+    if not depths:
+        return None
     if len(depths) != 1:
         raise RuntimeError(
             f"MIMO component {module_name!r} must have one checkpoint wrapper depth; found {sorted(depths)}."
@@ -2249,11 +2254,21 @@ def _align_mimo_model_sharded_keys(
         set(model_state),
         module_name=module_name,
     )
+    if runtime_prefix is None:
+        return
     checkpoint_metadata = TorchDistLoadShardedStrategy().load_sharded_metadata(Path(checkpoint_name))
     checkpoint_prefix = _mimo_component_wrapper_prefix(
         set(checkpoint_metadata),
         module_name=module_name,
     )
+    if checkpoint_prefix is None:
+        # Leave the runtime keys unmapped so the load's strictness setting handles the missing component.
+        logger.warning(
+            "MIMO checkpoint %s has no keys for component %r; loading it without wrapper prefix mapping",
+            checkpoint_name,
+            module_name,
+        )
+        return
     if runtime_prefix == checkpoint_prefix:
         return
 
@@ -3921,7 +3936,11 @@ def _load_global_dist_base_checkpoint(
     )
     load_strategy = TorchDistLoadShardedStrategy()
     if ckpt_cfg.fully_parallel_load:
-        load_strategy = FullyParallelLoadStrategyWrapper(load_strategy, _checkpoint_dp_cp_group(pg_collection))
+        load_strategy = FullyParallelLoadStrategyWrapper(
+            load_strategy,
+            _checkpoint_dp_cp_group(pg_collection),
+            per_rank_object_load=is_megatron_mimo,
+        )
     if checkpointing_context is not None:
         checkpointing_context["load_strategy"] = load_strategy
     validate_sharding_integrity = True
@@ -4004,9 +4023,9 @@ def _load_base_checkpoint(
                 release=False,
                 checkpoint_path_override=checkpoint_path,
                 checkpointing_context=checkpointing_context,
+                is_megatron_mimo=is_megatron_mimo,
                 pg_collection=pg_collection,
                 cfg=cfg,
-                is_megatron_mimo=is_megatron_mimo,
             )
         elif ckpt_format == "fsdp_dtensor":
             return load_fsdp_dtensor_checkpoint(

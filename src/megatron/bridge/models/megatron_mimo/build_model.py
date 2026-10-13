@@ -78,6 +78,7 @@ def build_megatron_mimo_model(
         wrap_with_ddp=wrap_with_ddp,
         data_parallel_random_init=data_parallel_random_init,
         use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
+        infra=infra,
     )
     mimo_model = model_list[0]
 
@@ -135,6 +136,8 @@ def _bridge_parallel_state_globals(local_pg_collection) -> None:
     mpu._TENSOR_MODEL_PARALLEL_GROUP = local_pg_collection.tp
     mpu._DATA_PARALLEL_GROUP = local_pg_collection.dp
     mpu._DATA_PARALLEL_GROUP_WITH_CP = getattr(local_pg_collection, "dp_cp", local_pg_collection.dp)
+    mpu._TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = local_pg_collection.tp_dp_cp
+    mpu._TENSOR_AND_CONTEXT_PARALLEL_GROUP = local_pg_collection.tp_cp
     if getattr(local_pg_collection, "pp", None) is not None:
         mpu._PIPELINE_MODEL_PARALLEL_GROUP = local_pg_collection.pp
     # Some conversion paths read expert groups unconditionally. TP is the
