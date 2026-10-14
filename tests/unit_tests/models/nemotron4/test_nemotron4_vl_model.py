@@ -534,6 +534,43 @@ def test_media_merge_validity_mask_filters_placeholders():
         model._merge_projected_media(torch.zeros(3, 1, 2), input_ids, torch.ones(2, 2), torch.tensor([True]))
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize("size_keys", [("imgs_sizes",), ("image_sizes",), ("imgs_sizes", "image_sizes")])
+def test_forward_accepts_matching_image_size_aliases(size_keys: tuple[str, ...]) -> None:
+    model = _merge_model()
+    model.pre_process = True
+    model.context_parallel_lm = 1
+    model.sequence_parallel_lm = False
+    model.config = SimpleNamespace(mtp_num_layers=0)
+    model.language_model = MagicMock(return_value=torch.zeros(1, 2, 2))
+    model.language_model.embedding = MagicMock(return_value=torch.zeros(2, 1, 2))
+    model._encode_images = MagicMock(return_value=torch.ones(1, 2))
+    # NeMo-RL packs imgs_sizes as int32 while Pixtral emits image_sizes as int64.
+    sizes = torch.tensor([[28, 28]], dtype=torch.int32)
+    size_args = {key: sizes if key == "imgs_sizes" else sizes.long() for key in size_keys}
+
+    Nemotron4VLModel.forward(model, torch.tensor([[7, 9]]), pixel_values=torch.ones(1, 4, 588), **size_args)
+
+    passed_sizes = model._encode_images.call_args.args[1]
+    assert passed_sizes is size_args["imgs_sizes" if "imgs_sizes" in size_args else "image_sizes"]
+    torch.testing.assert_close(
+        model.language_model.call_args.kwargs["decoder_input"][:, 0], torch.tensor([[1.0, 1.0], [0.0, 0.0]])
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("image_sizes", [torch.tensor([[42, 28]]), torch.tensor([[28, 28], [28, 28]])])
+def test_forward_rejects_conflicting_image_size_aliases(image_sizes: torch.Tensor) -> None:
+    model = _merge_model()
+    with pytest.raises(ValueError, match="imgs_sizes and image_sizes must match"):
+        Nemotron4VLModel.forward(
+            model,
+            torch.tensor([[7, 9]]),
+            imgs_sizes=torch.tensor([[28, 28]], dtype=torch.int32),
+            image_sizes=image_sizes,
+        )
+
+
 def test_forward_derives_validity_from_padding_then_attention_mask():
     """Precedence: explicit mask > ~padding_mask > 2-D attention mask; 4-D masks are ignored."""
     model = _merge_model()

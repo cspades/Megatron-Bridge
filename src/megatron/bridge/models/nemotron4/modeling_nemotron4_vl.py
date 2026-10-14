@@ -478,7 +478,8 @@ class Nemotron4VLModel(MegatronModule):
 
         ``pixel_values``/``image_sizes`` are accepted as aliases of
         ``images``/``imgs_sizes`` because the HF Nemotron4 processor emits those
-        names.
+        names. Both size names may be supplied when their shapes and values match;
+        in that case ``imgs_sizes`` is retained.
 
         Returns:
             Model output, or ``(output, local_loss_mask)`` when this model
@@ -490,9 +491,10 @@ class Nemotron4VLModel(MegatronModule):
         if images is None:
             images = pixel_values
         if image_sizes is not None:
-            if imgs_sizes is not None:
-                raise ValueError("Pass image sizes as either imgs_sizes or image_sizes, not both.")
-            imgs_sizes = image_sizes
+            if imgs_sizes is None:
+                imgs_sizes = image_sizes
+            elif not torch.equal(imgs_sizes, image_sizes):
+                raise ValueError("imgs_sizes and image_sizes must match when both are provided.")
 
         lm_input_ids = input_ids
         combined_embeddings = None
