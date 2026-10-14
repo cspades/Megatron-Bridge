@@ -14,7 +14,6 @@ from megatron.core.packed_seq_params import PackedSeqParams
 if importlib.util.find_spec("megatron.core.models.hybrid.shortcut_block") is None:
     pytest.skip("Nemotron4 requires its MCore fork", allow_module_level=True)
 
-from megatron.core.models.mimo.submodules.encoder_dp_media_balancer import EncoderDPMediaBalancedVisionSubmodules
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 
 from megatron.bridge.models.megatron_mimo.conversion import (
@@ -232,20 +231,6 @@ def test_language_spec_uses_the_saved_spec_with_the_stride_safe_gdp_mixer():
     language = provider.build_language_model_spec()
     mixer = language.params["hybrid_stack_spec"].submodules.mamba_layer.submodules.mixer
     assert mixer.module is Nemotron4GatedDeltaProductMixer
-
-
-def test_images_module_balances_media_on_request():
-    provider = _provider(mimo_encoder_dp_media_balance=True)
-    images = provider.build_mimo_modality_submodules_spec()["images"]
-    assert images.module is EncoderDPMediaBalancedVisionSubmodules
-    assert images.params == {
-        "encoder_name": "pixtral",
-        "frame_weight": 165,
-        "language_hidden_size": 128,
-        "pixel_dtype": provider.params_dtype,
-        "patch_dim": 14,
-        "temporal_patch_size": 1,
-    }
 
 
 def test_vision_encoder_takes_the_mimo_payload(monkeypatch):

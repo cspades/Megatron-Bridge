@@ -371,10 +371,6 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
     """Apply the ViT 2D RoPE with Transformer Engine's fused kernel. Needs a Megatron Core whose fused RoPE
     applies per-token frequencies of packed inputs; with an older Core, packed images get wrong angles and no
     error is raised."""
-    mimo_encoder_dp_media_balance: bool = False
-    """MegatronMIMO: divide the images over the encoder data-parallel ranks (Core's media balancer)."""
-    mimo_encoder_dp_media_frame_weight: int = 165
-    """Per-frame cost, in patches, that the media balancer adds to each image."""
 
     # --- legacy native-checkpoint hydration (non-MIMO checkpoints converted from the fork) ---
     checkpoint_path: str = ""
@@ -421,26 +417,10 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
         vision_config, projection_config = self._vision_configs(
             self._copy_config_without_runtime_process_groups(deep=True)
         )
-        modality_module, modality_params = VisionModalitySubmodules, {}
-        if self.mimo_encoder_dp_media_balance:
-            # Imported here: Megatron-LM forks without the media balancer still load this provider.
-            from megatron.core.models.mimo.submodules.encoder_dp_media_balancer import (
-                EncoderDPMediaBalancedVisionSubmodules,
-            )
-
-            modality_module = EncoderDPMediaBalancedVisionSubmodules
-            modality_params = {
-                "encoder_name": "pixtral",
-                "frame_weight": self.mimo_encoder_dp_media_frame_weight,
-                "language_hidden_size": self.hidden_size,
-                "pixel_dtype": vision_config.params_dtype,
-                "patch_dim": self.patch_dim,
-                "temporal_patch_size": 1,
-            }
         return {
             "images": ModuleSpec(
-                module=modality_module,
-                params=modality_params,
+                module=VisionModalitySubmodules,
+                params={},
                 submodules={
                     "encoders": {
                         "pixtral": ModuleSpec(

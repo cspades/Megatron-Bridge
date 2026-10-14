@@ -165,8 +165,8 @@ class Nemotron4MIMOVisionEncoder(_WithoutTEExtraState, ViTModel):
     ) -> torch.Tensor:
         """Encode the MIMO packed-image payload, one ``imgs_sizes`` row per image.
 
-        Images have one frame, so ``num_frames`` is not used. The media balancer checks the
-        output rows against ``expected_output_counts``.
+        Images have one frame, so ``num_frames`` is not used. ``expected_output_counts`` is part
+        of the payload and is not used here.
         """
         del num_frames, expected_output_counts
         # The ViT reads the patch grid on the host; MIMO payloads carry it on the GPU.
