@@ -544,6 +544,7 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
         post_wrap_hook: Optional[Callable[[List[MegatronModule]], List[MegatronModule]]] = None,
         *,
         infra: MegatronMIMOInfra | None = None,
+        use_layer_wise_param_layout: bool = True,
     ) -> List[MegatronModule]:
         """Build MegatronMIMO model with heterogeneous parallelism and DDP wrapping.
 
@@ -579,6 +580,8 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
             pre_wrap_hook: Callable(s) to modify model before wrapping.
             post_wrap_hook: Callable to modify model after wrapping.
             infra: Infra from build_infra() to use. Built if None.
+            use_layer_wise_param_layout: With the layer-wise optimizer, use shard-aligned DDP buffers.
+                False keeps the default DDP buffers (compact layer-wise optimizer).
 
         Returns:
             List containing the wrapped MimoModel.
@@ -661,6 +664,7 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
                     grids=infra.module_to_grid_map,
                     pg_collections=infra.pg_collections,
                     use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
+                    use_layer_wise_param_layout=use_layer_wise_param_layout,
                 )
                 for m in model_list
             ]

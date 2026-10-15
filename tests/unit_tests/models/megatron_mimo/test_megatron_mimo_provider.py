@@ -537,9 +537,14 @@ class TestMegatronMIMOProvider:
         # Should have set variable_seq_lengths=True
         assert mock_config.variable_seq_lengths is True
 
+    @pytest.mark.parametrize(
+        ("layout_kwargs", "expected_layout"), [({}, True), ({"use_layer_wise_param_layout": False}, False)]
+    )
     @patch("megatron.bridge.models.megatron_mimo.megatron_mimo_provider.wrap_megatron_mimo_model_distributed")
     @patch("megatron.bridge.models.megatron_mimo.megatron_mimo_provider.get_model_config")
-    def test_provide_distributed_model_forwards_layer_wise_optimizer_flag(self, _mock_get_config, mock_wrap):
+    def test_provide_distributed_model_forwards_layer_wise_optimizer_flag(
+        self, _mock_get_config, mock_wrap, layout_kwargs, expected_layout
+    ):
         """The per-module DDP wrap must know that the layer-wise optimizer is used."""
         provider = MegatronMIMOProvider(
             language_model_spec=ModuleSpec(module=Mock, params={"config": Mock()}),
@@ -556,11 +561,14 @@ class TestMegatronMIMOProvider:
             patch.object(provider, "build_infra"),
             patch.object(provider, "provide", return_value=MagicMock()),
         ):
-            provider.provide_distributed_model(ddp_config=ddp_config, use_layer_wise_distributed_optimizer=True)
+            provider.provide_distributed_model(
+                ddp_config=ddp_config, use_layer_wise_distributed_optimizer=True, **layout_kwargs
+            )
 
         mock_wrap.assert_called_once()
         assert mock_wrap.call_args.kwargs["ddp_config"] is ddp_config
         assert mock_wrap.call_args.kwargs["use_layer_wise_distributed_optimizer"] is True
+        assert mock_wrap.call_args.kwargs["use_layer_wise_param_layout"] is expected_layout
 
 
 class TestMegatronMIMOInfra:

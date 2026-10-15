@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch.distributed as dist
 from megatron.core import parallel_state as mpu
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -98,7 +99,10 @@ def test_build_megatron_mimo_model_creates_process_groups_once(monkeypatch):
     assert mock_wrap_ddp.call_args.kwargs["pg_collections"] is infra.pg_collections
 
 
-def test_build_model_forwards_layer_wise_optimizer_flag(monkeypatch):
+@pytest.mark.parametrize(
+    ("layout_kwargs", "expected_layout"), [({}, True), ({"use_layer_wise_param_layout": False}, False)]
+)
+def test_build_model_forwards_layer_wise_optimizer_flag(monkeypatch, layout_kwargs, expected_layout):
     provider = MagicMock()
     provider.provide_distributed_model.return_value = [MagicMock()]
     monkeypatch.setattr(build_model, "dist", MagicMock())
@@ -113,7 +117,8 @@ def test_build_model_forwards_layer_wise_optimizer_flag(monkeypatch):
         ),
     ):
         build_model.build_megatron_mimo_model(
-            provider, ddp_config=MagicMock(), use_layer_wise_distributed_optimizer=True
+            provider, ddp_config=MagicMock(), use_layer_wise_distributed_optimizer=True, **layout_kwargs
         )
 
     assert provider.provide_distributed_model.call_args.kwargs["use_layer_wise_distributed_optimizer"] is True
+    assert provider.provide_distributed_model.call_args.kwargs["use_layer_wise_param_layout"] is expected_layout

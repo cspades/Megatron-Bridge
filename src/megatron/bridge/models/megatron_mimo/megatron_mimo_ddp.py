@@ -52,6 +52,7 @@ def wrap_megatron_mimo_model_distributed(
     pg_collections: Dict[str, Optional["ProcessGroupCollection"]],
     *,
     use_layer_wise_distributed_optimizer: bool = False,
+    use_layer_wise_param_layout: bool = True,
 ) -> "MimoModel":
     """Wrap MegatronMIMO model's submodules with mixed precision and DDP.
 
@@ -64,6 +65,10 @@ def wrap_megatron_mimo_model_distributed(
         grids: Module name to HyperCommGrid mapping.
         pg_collections: Module name to ProcessGroupCollection mapping.
         use_layer_wise_distributed_optimizer: Build shard-aligned layouts for layer-wise optimizers.
+        use_layer_wise_param_layout: With the layer-wise optimizer, use shard-aligned DDP buffers.
+            False keeps the default DDP buffers and ``ddp_config.use_distributed_optimizer``, so
+            the layer-wise optimizer takes its legacy variable-size parameter sync (the NM4
+            compact-Muon recipes). Mirrors Megatron-Core's ``_ddp_wrap``.
 
     Returns:
         The same megatron_mimo_model with wrapped submodules.
@@ -81,7 +86,7 @@ def wrap_megatron_mimo_model_distributed(
         module: nn.Module, config: "TransformerConfig", pg: "ProcessGroupCollection"
     ) -> "DistributedDataParallel":
         layout = None
-        if use_layer_wise_distributed_optimizer:
+        if use_layer_wise_distributed_optimizer and use_layer_wise_param_layout:
             ddp_config.use_distributed_optimizer = True
             tag_params_for_buffer_routing([module])
             groups = pg.setup_process_groups_for_ddp(pg, config, ddp_config)

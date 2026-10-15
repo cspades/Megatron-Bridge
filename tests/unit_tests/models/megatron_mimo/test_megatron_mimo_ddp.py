@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 from megatron.core.transformer.module import Float16Module
 
@@ -358,12 +359,13 @@ class TestWrapMegatronMIMOModelDistributed:
         assert precision_wrapped.module is language_model
         assert language_model.weight.dtype == torch.bfloat16
 
+    @pytest.mark.parametrize("layout_kwargs", [{}, {"use_layer_wise_param_layout": True}])
     @patch("megatron.core.optimizer.layer_wise_optimizer.tag_params_for_buffer_routing")
     @patch("megatron.core.optimizer.layer_wise_optimizer.LayerWiseDistributedOptimizer")
     @patch("megatron.core.distributed.DistributedDataParallel")
     @patch("torch.distributed.get_rank")
     def test_layer_wise_optimizer_builds_shard_aligned_layouts(
-        self, mock_get_rank, mock_ddp, mock_layer_wise_optimizer, mock_tag_params
+        self, mock_get_rank, mock_ddp, mock_layer_wise_optimizer, mock_tag_params, layout_kwargs
     ):
         """The layer-wise optimizer (e.g. Muon) gets a shard-aligned DDP layout for every component."""
         mock_get_rank.return_value = 0
@@ -389,6 +391,7 @@ class TestWrapMegatronMIMOModelDistributed:
             grids,
             pg_collections,
             use_layer_wise_distributed_optimizer=True,
+            **layout_kwargs,
         )
 
         layout = mock_layer_wise_optimizer.compute_full_param_layout.return_value
@@ -430,4 +433,45 @@ class TestWrapMegatronMIMOModelDistributed:
         mock_tag_params.assert_not_called()
         mock_layer_wise_optimizer.compute_full_param_layout.assert_not_called()
         assert [call.kwargs["full_param_layout"] for call in mock_ddp.call_args_list] == [None, None]
+        assert ddp_config.use_distributed_optimizer is False
+
+    @patch("megatron.core.optimizer.layer_wise_optimizer.tag_params_for_buffer_routing")
+    @patch("megatron.core.optimizer.layer_wise_optimizer.LayerWiseDistributedOptimizer")
+    @patch("megatron.core.distributed.DistributedDataParallel")
+    @patch("torch.distributed.get_rank")
+    def test_compact_layer_wise_layout_keeps_default_ddp_buffers(
+        self, mock_get_rank, mock_ddp, mock_layer_wise_optimizer, mock_tag_params
+    ):
+        """Compact layer-wise mode (as Core's _ddp_wrap): no layout, no tags, DDP config unchanged."""
+        mock_get_rank.return_value = 0
+
+        megatron_mimo_model = self._create_mock_megatron_mimo_model(has_language_model=True, modality_names=["images"])
+        language_model = megatron_mimo_model.language_model
+        images = megatron_mimo_model.modality_submodules["images"]
+        ddp_config = MagicMock(use_distributed_optimizer=False)
+        parallelism = self._create_megatron_mimo_parallelism_config({"language": {"dp": 2}, "images": {"dp": 2}})
+        grids = {
+            "language": self._create_mock_grid(rank_offset=0, size=2),
+            "images": self._create_mock_grid(rank_offset=0, size=2),
+        }
+        pg_collections = {"language": MagicMock(), "images": MagicMock()}
+
+        wrap_megatron_mimo_model_distributed(
+            megatron_mimo_model,
+            ddp_config,
+            parallelism,
+            grids,
+            pg_collections,
+            use_layer_wise_distributed_optimizer=True,
+            use_layer_wise_param_layout=False,
+        )
+
+        # Untagged params keep every bucket in the layer-wise optimizer's legacy parameter sync.
+        mock_tag_params.assert_not_called()
+        mock_layer_wise_optimizer.compute_full_param_layout.assert_not_called()
+        for pg in pg_collections.values():
+            pg.setup_process_groups_for_ddp.assert_not_called()
+        assert [call.kwargs["module"] for call in mock_ddp.call_args_list] == [language_model, images]
+        assert [call.kwargs["full_param_layout"] for call in mock_ddp.call_args_list] == [None, None]
+        assert [call.kwargs["ddp_config"] for call in mock_ddp.call_args_list] == [ddp_config, ddp_config]
         assert ddp_config.use_distributed_optimizer is False

@@ -137,6 +137,8 @@ def _update_megatron_mimo_model_config_funcs(
 def setup_megatron_mimo(
     state: GlobalState,
     build_data_iterators_fn: Optional[Callable] = None,
+    *,
+    use_layer_wise_param_layout: bool = True,
 ) -> MegatronMIMOSetupOutput:
     """MegatronMIMO-specific setup helper.
 
@@ -155,6 +157,9 @@ def setup_megatron_mimo(
             create the optimizer.
         build_data_iterators_fn: Optional function to build data iterators.
             Should have signature: (cfg, megatron_mimo_infra) -> (train_iter, valid_iter)
+        use_layer_wise_param_layout: With ``cfg.optimizer.use_layer_wise_distributed_optimizer``,
+            use shard-aligned DDP buffers. False keeps the default DDP buffers (compact
+            layer-wise optimizer), as ``use_layer_wise_param_layout`` does for ``get_model``.
 
     Returns:
         MegatronMIMOSetupOutput containing all components for training.
@@ -193,6 +198,7 @@ def setup_megatron_mimo(
         bf16=getattr(cfg.model, "bf16", True),
         seed=cfg.rng.seed,
         use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
+        use_layer_wise_param_layout=use_layer_wise_param_layout,
     )
 
     logger.info(f"Rank {dist.get_rank()}: Creating multimodule communicator")

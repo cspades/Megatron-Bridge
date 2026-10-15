@@ -339,11 +339,14 @@ def test_finish_train_calls_cleanup():
     m_destroy.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    ("layout_kwargs", "expected_layout"), [({}, True), ({"use_layer_wise_param_layout": False}, False)]
+)
 @patch("megatron.bridge.training.setup_megatron_mimo.unwrap_megatron_mimo_model")
 @patch("megatron.bridge.training.setup_megatron_mimo.get_model_config")
 @patch("megatron.bridge.training.setup_megatron_mimo.dist")
 def test_setup_megatron_mimo_asserts_when_constructor_fields_missing(
-    mock_dist, mock_get_model_config, mock_unwrap_megatron_mimo_model
+    mock_dist, mock_get_model_config, mock_unwrap_megatron_mimo_model, layout_kwargs, expected_layout
 ):
     """setup_megatron_mimo guardrail should fail when module_to_grid_map is missing at construction."""
     from megatron.bridge.training.setup_megatron_mimo import setup_megatron_mimo
@@ -382,7 +385,7 @@ def test_setup_megatron_mimo_asserts_when_constructor_fields_missing(
         mock_state = MagicMock()
         mock_state.cfg = cfg
         with pytest.raises(AssertionError, match="module_to_grid_map must be set"):
-            setup_megatron_mimo(state=mock_state)
+            setup_megatron_mimo(state=mock_state, **layout_kwargs)
 
     mock_build_model.assert_called_once()
     assert mock_build_model.call_args.kwargs["seed"] == cfg.rng.seed
@@ -390,3 +393,4 @@ def test_setup_megatron_mimo_asserts_when_constructor_fields_missing(
         mock_build_model.call_args.kwargs["use_layer_wise_distributed_optimizer"]
         is cfg.optimizer.use_layer_wise_distributed_optimizer
     )
+    assert mock_build_model.call_args.kwargs["use_layer_wise_param_layout"] is expected_layout
