@@ -9,6 +9,8 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.models.vision.vit_model import ViTModel
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.transformer.module import Float16Module, mark_keep_in_fp32
+from megatron.core.transformer.transformer_config import TransformerConfig
 
 
 if importlib.util.find_spec("megatron.core.models.hybrid.shortcut_block") is None:
@@ -42,26 +44,56 @@ def test_family_import_registers_mimo_conversion():
     assert get_mimo_conversion_spec(Nemotron4Bridge) is nemotron4_mimo_conversion_spec
 
 
-def test_bfloat16_cast_preserves_fp32_control_state():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_dtype_cast_preserves_fp32_control_state(dtype):
     model = Nemotron4MIMOLanguageModel.__new__(Nemotron4MIMOLanguageModel)
     torch.nn.Module.__init__(model)
     model.block = torch.nn.Module()
+    model.block.gdp = torch.nn.Module()
     original = torch.tensor([0.1234567, -0.7654321], dtype=torch.float32)
     model.block.weight = torch.nn.Parameter(original.clone())
     model.block.A_log = torch.nn.Parameter(original.clone())
     model.block.logit = torch.nn.Parameter(original.clone())
     model.block.logit.is_residual_map_parameter = True
-    model.block.logit.grad = original.clone()
     model.block.retention_logit = torch.nn.Parameter(original.clone())
     model.block.retention_logit.is_wide_residual_retention_parameter = True
     model.block.register_buffer("expert_bias", original.clone())
     model.block.register_buffer("qb_bin_bounds", original.clone())
-    model.bfloat16()
-    assert model.block.weight.dtype == torch.bfloat16
-    for name in ("A_log", "logit", "retention_logit", "expert_bias", "qb_bin_bounds"):
-        torch.testing.assert_close(getattr(model.block, name), original, rtol=0, atol=0)
-    assert model.block.logit.is_residual_map_parameter
-    torch.testing.assert_close(model.block.logit.grad, original, rtol=0, atol=0)
+    model.block.register_buffer("ordinary_buffer", original.clone())
+    model.block.gdp.dt_bias = mark_keep_in_fp32(torch.nn.Parameter(original.clone()))
+    model.block.gdp.other_parameter = mark_keep_in_fp32(torch.nn.Parameter(original.clone()))
+    model.block.gdp.register_buffer("other_buffer", mark_keep_in_fp32(original.clone()))
+    for parameter in model.parameters():
+        parameter.grad = original.clone()
+    model.block.gdp.dt_bias.tensor_model_parallel = True
+    parameter_ids = {name: id(parameter) for name, parameter in model.named_parameters()}
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=4,
+        num_attention_heads=1,
+        bf16=dtype == torch.bfloat16,
+        fp16=dtype == torch.float16,
+        params_dtype=dtype,
+    )
+    model.to(dtype=dtype)
+    # The real MIMO provider casts before wrapping. A buffer's marker must
+    # survive the first cast so this second conversion still protects it.
+    for wrap in (False, True):
+        if wrap:
+            model = Float16Module(config, model).module
+        for name, tensor in list(model.named_parameters()) + list(model.named_buffers()):
+            expected = original.to(dtype) if name in ("block.weight", "block.ordinary_buffer") else original
+            torch.testing.assert_close(tensor, expected, rtol=0, atol=0)
+        for name, parameter in model.named_parameters():
+            assert id(parameter) == parameter_ids[name]
+            expected = original.to(dtype) if name == "block.weight" else original
+            torch.testing.assert_close(parameter.grad, expected, rtol=0, atol=0)
+        assert model.block.gdp.dt_bias.keep_in_fp32
+        assert model.block.gdp.other_parameter.keep_in_fp32
+        assert model.block.gdp.other_buffer.keep_in_fp32
+        assert model.block.gdp.dt_bias.tensor_model_parallel
+        assert model.block.logit.is_residual_map_parameter
+        assert model.block.retention_logit.is_wide_residual_retention_parameter
 
 
 def _parallelism(**image_kwargs):

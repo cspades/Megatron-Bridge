@@ -188,19 +188,23 @@ class Nemotron4MIMOLanguageModel(_WithoutTEExtraState, HybridModel):
     def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True) -> Self:
         retained = []
         for name, tensor in list(self.named_parameters()) + list(self.named_buffers()):
+            keep_in_fp32 = getattr(tensor, "keep_in_fp32", False)
             if (
-                getattr(tensor, "is_residual_map_parameter", False)
+                keep_in_fp32
+                or getattr(tensor, "is_residual_map_parameter", False)
                 or getattr(tensor, "is_wide_residual_retention_parameter", False)
                 or name.endswith((".A_log", ".expert_bias", ".qb_bin_bounds"))
             ):
                 grad = tensor.grad.detach() if tensor.grad is not None else None
-                retained.append((name, isinstance(tensor, torch.nn.Parameter), tensor.detach(), grad))
+                retained.append((name, isinstance(tensor, torch.nn.Parameter), tensor.detach(), grad, keep_in_fp32))
         super()._apply(fn, recurse=recurse)
         # Keep parameter objects and their parallelism/optimizer attributes. A
         # detached reference retains the original storage across Module._apply.
-        for name, is_parameter, original, original_grad in retained:
+        for name, is_parameter, original, original_grad, keep_in_fp32 in retained:
             tensor = self.get_parameter(name) if is_parameter else self.get_buffer(name)
             tensor.data = original.to(device=tensor.device, dtype=torch.float32)
+            if keep_in_fp32:
+                tensor.keep_in_fp32 = True
             if original_grad is not None:
                 tensor.grad.data = original_grad.to(device=tensor.device, dtype=torch.float32)
         return self
