@@ -41,7 +41,10 @@ def test_distributed_emerging_optimizer_normalization(name, source):
         assert cfg.optimizer.optimizer == name.removeprefix("dist_")
         assert cfg.optimizer.use_layer_wise_distributed_optimizer
         assert not cfg.optimizer.use_distributed_optimizer
-        assert cfg.ddp.use_distributed_optimizer
+        # Model wrapping enables this only when it constructs a shard-aligned
+        # LayerWise layout. Leaving it enabled here makes compact mode trigger
+        # DDP's ordinary DistributedOptimizer auto-layout.
+        assert not cfg.ddp.use_distributed_optimizer
         assert uses_distributed_optimizer(cfg.optimizer)
 
 

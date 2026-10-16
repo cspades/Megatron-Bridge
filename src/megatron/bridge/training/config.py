@@ -2321,9 +2321,12 @@ def _validate_and_sync_distributed_optimizer_settings(config: ConfigContainer) -
     if uses_layer_wise_optimizer(config.optimizer):
         if config.ddp.num_distributed_optimizer_instances != 1:
             raise ValueError("Layer-wise optimizers require num_distributed_optimizer_instances=1.")
-        # Both distributed implementations use reduce-scatter. Model setup must
-        # additionally pass layer-wise intent so Core chooses the correct layout.
-        config.ddp.use_distributed_optimizer = True
+        # The DDP flag selects the ordinary DistributedOptimizer layout. Keep it
+        # disabled for LayerWise here; model wrapping enables it only when a
+        # shard-aligned LayerWise parameter layout is actually requested. This
+        # preserves the compact LayerWise path, which intentionally supplies no
+        # full parameter layout and performs its own parameter synchronization.
+        config.ddp.use_distributed_optimizer = False
     elif ddp_setting or optimizer_setting:
         if ddp_setting != optimizer_setting:
             warn_rank_0(
