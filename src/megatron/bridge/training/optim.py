@@ -25,7 +25,6 @@ from megatron.core.optimizer import (
     get_megatron_optimizer,
     get_mup_config_overrides,
 )
-from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
@@ -36,6 +35,7 @@ from megatron.bridge.training.config import (
     OptimizerConfigOverrideProviderContext,
     SchedulerConfig,
 )
+from megatron.bridge.training.utils.optimizer_utils import normalize_optimizer_config
 
 
 G_LOGGER = logging.getLogger(__name__)
@@ -61,6 +61,11 @@ def setup_optimizer(
     Returns:
         tuple containing the optimizer and scheduler
     """
+    if not hasattr(optimizer_config, "provide"):
+        # setup_optimizer is a public construction boundary and is also used by
+        # callers that do not run ConfigContainer.validate()/finalize() first.
+        normalize_optimizer_config(optimizer_config)
+
     if optimizer_config_override_provider is None:
         optimizer_config_override_provider = OptimizerConfigOverrideProvider()
 
@@ -92,21 +97,12 @@ def setup_optimizer(
             use_gloo_process_groups=use_gloo_process_groups,
             pg_collection=pg_collection,
         )
-    elif "muon" not in optimizer_config.optimizer and "soap" not in optimizer_config.optimizer:
+    else:
         optimizer = get_megatron_optimizer(
             config=optimizer_config,
             model_chunks=model,
             config_overrides=config_overrides,
             use_gloo_process_groups=use_gloo_process_groups,
-            pg_collection=pg_collection,
-        )
-    else:
-        optimizer = get_megatron_muon_optimizer(
-            config=optimizer_config,
-            model_chunks=model,
-            config_overrides=config_overrides,
-            use_gloo_process_groups=use_gloo_process_groups,
-            layer_wise_distributed_optimizer="dist" in optimizer_config.optimizer,
             pg_collection=pg_collection,
         )
 

@@ -8,6 +8,7 @@ Note: This module only supports DDP wrapping. FSDP is not yet implemented.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import TYPE_CHECKING, Dict, Optional
 
 import torch
@@ -83,30 +84,33 @@ def wrap_megatron_mimo_model_distributed(
     from megatron.bridge.training.megatron_mimo_parallel_utils import is_current_rank_in_grid
 
     def wrap_module(
-        module: nn.Module, config: "TransformerConfig", pg: "ProcessGroupCollection"
+        module: nn.Module,
+        config: "TransformerConfig",
+        pg: "ProcessGroupCollection",
+        module_ddp_config: "DistributedDataParallelConfig",
     ) -> "DistributedDataParallel":
         layout = None
         if use_layer_wise_distributed_optimizer and use_layer_wise_param_layout:
-            ddp_config.use_distributed_optimizer = True
+            module_ddp_config.use_distributed_optimizer = True
             tag_params_for_buffer_routing([module])
-            groups = pg.setup_process_groups_for_ddp(pg, config, ddp_config)
-            bucket_size = ddp_config.bucket_size
-            if ddp_config.num_buckets is not None:
-                bucket_size = sum(p.numel() for p in module.parameters()) // ddp_config.num_buckets
+            groups = pg.setup_process_groups_for_ddp(pg, config, module_ddp_config)
+            bucket_size = module_ddp_config.bucket_size
+            if module_ddp_config.num_buckets is not None:
+                bucket_size = sum(p.numel() for p in module.parameters()) // module_ddp_config.num_buckets
             elif bucket_size is None:
                 bucket_size = max(40000000, 1000000 * groups["dp_group"].size())
-            if not ddp_config.overlap_grad_reduce or groups["pp_group"].rank() > 0:
+            if not module_ddp_config.overlap_grad_reduce or groups["pp_group"].rank() > 0:
                 bucket_size = None
             layout = LayerWiseDistributedOptimizer.compute_full_param_layout(
                 [p for p in module.parameters() if p.requires_grad],
                 bucket_size,
                 groups["intra_dp_cp_group"].size(),
-                ddp_config,
+                module_ddp_config,
                 expert_data_parallel_world_size=groups["intra_expt_dp_group"].size(),
             )
         return DistributedDataParallel(
             config=config,
-            ddp_config=ddp_config,
+            ddp_config=module_ddp_config,
             module=module,
             pg_collection=pg,
             full_param_layout=layout,
@@ -128,6 +132,7 @@ def wrap_megatron_mimo_model_distributed(
                     language_model,
                     language_config,
                     llm_pg,
+                    ddp_config,
                 )
                 # MCore's DDP wrapper does not proxy arbitrary module methods.
                 # MimoModel._forward_language_module() checks for and calls
@@ -173,10 +178,21 @@ def wrap_megatron_mimo_model_distributed(
                     component_config,
                     encoder=True,
                 )
+                # Uneven media participation can leave encoder replicas
+                # unsynchronized when communication is hook-driven: a rank with
+                # no encoder backward pass never launches the matching reduction.
+                # Keep language overlap, but make encoder reductions synchronous
+                # for both conventional and layer-wise optimizers.
+                encoder_ddp_config = (
+                    dataclasses.replace(ddp_config, overlap_grad_reduce=False, overlap_param_gather=False)
+                    if ddp_config.overlap_grad_reduce is True or ddp_config.overlap_param_gather is True
+                    else ddp_config
+                )
                 wrapped = wrap_module(
                     precision_wrapped,
                     component_config,
                     module_pg,
+                    encoder_ddp_config,
                 )
                 # MCore optimizers unwrap DDP and read process groups from the wrapped module.
                 wrapped.module.pg_collection = module_pg
