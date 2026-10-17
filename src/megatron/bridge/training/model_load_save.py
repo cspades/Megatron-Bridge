@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import argparse
+import copy
 import logging
 import os
 from contextlib import contextmanager
@@ -496,6 +497,7 @@ def load_megatron_model(
     # Deserialized providers have not been finalized yet: derive GTP from the
     # saved public shard counts before resetting the model-parallel defaults.
     saved_weight_topology = _get_checkpoint_weight_topology(model_cfg)
+    saved_model_config = copy.copy(model_cfg)
     saved_pipeline_model_parallel_size = getattr(model_cfg, "pipeline_model_parallel_size", 1)
     # If in single GPU environment, reset additional parallel settings
     model_cfg.tensor_model_parallel_size = 1
@@ -552,7 +554,10 @@ def load_megatron_model(
         model_cfg.pipeline_model_parallel_layout = None
 
     _validate_checkpoint_weight_topology(
-        saved=saved_weight_topology, requested=_get_checkpoint_weight_topology(model_cfg)
+        saved=saved_weight_topology,
+        requested=_get_checkpoint_weight_topology(model_cfg),
+        saved_model_config=saved_model_config,
+        requested_model_config=model_cfg,
     )
 
     # DeepEP and NCCL EP flex backends require TPxEP > 1, so single-rank loads fall back to allgather.

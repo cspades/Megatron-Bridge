@@ -58,22 +58,38 @@ def _get_checkpoint_weight_topology(model_config: Any) -> tuple[int, int, int, i
     return tp, gtp, etp, egtp
 
 
+def _is_ungated_nm4_config(config: Any) -> bool:
+    """Recognize NM4 providers whose gated vision tower is never GTP-sharded."""
+    if isinstance(config, Mapping):
+        target = config.get("_target_")
+        gated = config.get("gated_linear_unit")
+    else:
+        target = f"{type(config).__module__}.{type(config).__qualname__}"
+        gated = getattr(config, "gated_linear_unit", None)
+    return gated is False and target in {
+        "megatron.bridge.models.nemotron4.nemotron4_provider.Nemotron4VLModelProvider",
+        "megatron.bridge.models.experimental_nm4_llava_provider.ExperimentalNM4LlavaProvider",
+    }
+
+
 def _validate_checkpoint_weight_topology(
-    *, saved: tuple[int, int, int, int], requested: tuple[int, int, int, int]
+    *,
+    saved: tuple[int, int, int, int],
+    requested: tuple[int, int, int, int],
+    saved_model_config: Any = None,
+    requested_model_config: Any = None,
 ) -> None:
-    """Reject native resharding when either side uses the GTP SwiGLU layout."""
+    """Reject native GTP resharding unless both models have NM4's contiguous layout."""
     dense_changed = (saved[1] > 1 or requested[1] > 1) and saved[:2] != requested[:2]
     expert_changed = (saved[3] > 1 or requested[3] > 1) and saved[2:] != requested[2:]
     if not dense_changed and not expert_changed:
         return
-    # TODO(nemotron4): this guard exists because MCore's SwiGLU (gated_linear_unit) checkpoint
-    # layout interleaves gate/up rows per GTP shard, so reassembling shards as contiguous rows
-    # reorders them. Nemotron4 uses non-gated squared-ReLU MLPs/experts and never GTP-shards its
-    # vision tower, so a GTP reshard of a Nemotron4 checkpoint is a plain contiguous row gather.
-    # Consider relaxing the check when the saved model config has gated_linear_unit=False (and
-    # no gated expert/vision weights under GTP) so single-GPU export does not require loading at
-    # the saved GTP topology. Until then use the documented route: export HF at the saved
-    # topology, then import HF into the new topology.
+    # NM4's language MLPs/experts use non-gated squared ReLU. Its gated vision
+    # tower explicitly disables GTP in _make_replicated_single_stage(), so its
+    # gate/up layout cannot change when the language weight shards change.
+    # Unknown providers and missing metadata retain the conservative guard.
+    if _is_ungated_nm4_config(saved_model_config) and _is_ungated_nm4_config(requested_model_config):
+        return
     raise ValueError(
         "Resharding a GTP checkpoint is not supported: Megatron-Core's SwiGLU checkpoint "
         "layout can reorder gate/up rows when the weight-sharding topology changes. "

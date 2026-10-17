@@ -2522,7 +2522,10 @@ def _load_model_weights_from_checkpoint(
     requested_topology = _get_checkpoint_weight_topology(get_model_config(model[0]))
     if saved_model_config is not None:
         _validate_checkpoint_weight_topology(
-            saved=_get_checkpoint_weight_topology(saved_model_config), requested=requested_topology
+            saved=_get_checkpoint_weight_topology(saved_model_config),
+            requested=requested_topology,
+            saved_model_config=saved_model_config,
+            requested_model_config=get_model_config(model[0]),
         )
     elif requested_topology[1] > 1 or requested_topology[3] > 1:
         raise ValueError(
@@ -3105,6 +3108,8 @@ def _load_checkpoint_from_path(
                 _validate_checkpoint_weight_topology(
                     saved=_get_checkpoint_weight_topology(run_config["model"]),
                     requested=_get_checkpoint_weight_topology(cfg.model),
+                    saved_model_config=run_config["model"],
+                    requested_model_config=cfg.model,
                 )
             ckpt_tp_pp = _get_run_config_tp_pp(run_config["model"])
             run_tp_pp = (

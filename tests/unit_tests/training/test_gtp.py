@@ -103,6 +103,50 @@ def test_checkpoint_weight_topology_preserves_same_gtp_and_plain_resharding(save
     _validate_checkpoint_weight_topology(saved=saved, requested=requested)
 
 
+@pytest.mark.parametrize(
+    "saved,requested", [((1, 1, 1, 1), (1, 2, 1, 1)), ((1, 1, 1, 1), (1, 1, 1, 2)), ((1, 2, 1, 2), (1, 1, 1, 1))]
+)
+@pytest.mark.parametrize("legacy", [False, True])
+def test_checkpoint_weight_topology_allows_ungated_nm4(saved, requested, legacy):
+    from megatron.bridge.models.experimental_nm4_llava_provider import ExperimentalNM4LlavaProvider
+    from megatron.bridge.models.nemotron4.nemotron4_provider import Nemotron4VLModelProvider
+
+    provider = ExperimentalNM4LlavaProvider if legacy else Nemotron4VLModelProvider
+    model = provider()
+    serialized = {"_target_": f"{provider.__module__}.{provider.__qualname__}", "gated_linear_unit": False}
+    _validate_checkpoint_weight_topology(
+        saved=saved, requested=requested, saved_model_config=serialized, requested_model_config=model
+    )
+    _validate_checkpoint_weight_topology(
+        saved=saved, requested=requested, saved_model_config=model, requested_model_config=model
+    )
+
+
+@pytest.mark.parametrize("side", ["saved", "requested"])
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        None,
+        {},
+        {"gated_linear_unit": False},
+        {"_target_": "megatron.bridge.models.nemotron4.nemotron4_provider.Nemotron4VLModelProvider"},
+        {
+            "_target_": "megatron.bridge.models.nemotron4.nemotron4_provider.Nemotron4VLModelProvider",
+            "gated_linear_unit": True,
+        },
+    ],
+)
+def test_checkpoint_weight_topology_keeps_guard_for_unknown_or_gated_models(side, invalid):
+    valid = {
+        "_target_": "megatron.bridge.models.nemotron4.nemotron4_provider.Nemotron4VLModelProvider",
+        "gated_linear_unit": False,
+    }
+    configs = {"saved_model_config": valid, "requested_model_config": valid}
+    configs[f"{side}_model_config"] = invalid
+    with pytest.raises(ValueError, match="Resharding a GTP checkpoint"):
+        _validate_checkpoint_weight_topology(saved=(1, 1, 1, 1), requested=(1, 2, 1, 2), **configs)
+
+
 @pytest.mark.parametrize("dense_gtp_size", [None, 1, 2])
 def test_dataloader_process_group_excludes_cp_and_preserves_dense_gtp(dense_gtp_size):
     pg = SimpleNamespace(dp=object(), gtp_remat=None, expt_gtp_remat=MagicMock())
