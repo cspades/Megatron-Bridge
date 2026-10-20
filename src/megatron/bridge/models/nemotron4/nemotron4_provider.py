@@ -33,6 +33,7 @@ import copy
 import dataclasses
 import importlib.util
 import logging
+import math
 import os
 import tempfile
 from dataclasses import dataclass, field
@@ -365,6 +366,12 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
     vision_recompute_granularity: Literal["full", "selective"] | None = None
     vision_recompute_method: Literal["uniform", "block"] | None = None
     vision_recompute_num_layers: int | None = None
+    vision_recompute_budget_gib: float | None = None
+    """MIMO only: activation budget of one ViT micro-batch in GiB. Each micro-batch then sets its full-recompute
+    layer count and its MLP-only recompute layers to fit the budget (see ``Nemotron4MIMOVisionEncoder``).
+    Requires a positive finite budget, full / block vision recompute, and the fused ViT SwiGLU and RoPE (the per-patch
+    sizes assume them). The encoder must use BF16: the estimates have not been validated for MXFP8 or other encoder
+    precisions. The decoder may use FP8 independently. ``vision_recompute_num_layers`` then has no effect in training."""
     vision_bias_activation_fusion: bool = False
     """Run the ViT SwiGLU as one fused kernel (Core ``bias_swiglu_impl``) instead of unfused ops."""
     vision_apply_rope_fusion: bool = False
@@ -437,6 +444,7 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
                                 "pos_emb_type": "rope2d",
                                 "use_merger": self.spatial_merge_size > 1,
                                 "spatial_merge_size": self.spatial_merge_size,
+                                "recompute_budget_gib": self.vision_recompute_budget_gib,
                             },
                         )
                     },
@@ -523,6 +531,16 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
     # ------------------------------------------------------------------ runtime controls
     def _apply_vision_recompute_settings(self, vision_config: Any) -> None:
         """Apply explicitly requested activation recompute to the ViT tower."""
+        if self.vision_recompute_budget_gib is not None and (
+            not self.recompute_vision
+            or (self.vision_recompute_granularity, self.vision_recompute_method) != ("full", "block")
+            or not (self.vision_bias_activation_fusion and self.vision_apply_rope_fusion)
+            or not 0 < self.vision_recompute_budget_gib < math.inf
+        ):
+            raise ValueError(
+                "vision_recompute_budget_gib requires a positive finite budget, full / block vision recompute, and "
+                "vision_bias_activation_fusion and vision_apply_rope_fusion (its per-patch sizes assume them)."
+            )
         if not self.recompute_vision:
             vision_config.recompute_granularity = None
             vision_config.recompute_method = None
@@ -751,6 +769,8 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
 
     def provide(self, pre_process=None, post_process=None, vp_stage=None) -> Nemotron4VLModel:
         """Build the Nemotron4 VLM for the current provider parallel sizes."""
+        if self.vision_recompute_budget_gib is not None:
+            raise ValueError("vision_recompute_budget_gib is supported only by the MIMO vision encoder.")
         require_nemotron4_mcore()
         language_cfg = self._copy_config_without_runtime_process_groups(deep=True)
         vision_cfg, projection_cfg = self._vision_configs(language_cfg)

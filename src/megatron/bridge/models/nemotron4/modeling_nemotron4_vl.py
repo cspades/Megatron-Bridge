@@ -153,7 +153,14 @@ class _WithoutTEExtraState:
 
 
 class Nemotron4MIMOVisionEncoder(_WithoutTEExtraState, ViTModel):
-    """Pixtral-style ViT of the MIMO ``images`` module."""
+    """Pixtral-style ViT of the MIMO ``images`` module.
+
+    With ``recompute_budget_gib``, each training forward sets its recompute plan (see ``recompute_plan``).
+    """
+
+    def __init__(self, *args, recompute_budget_gib: float | None = None, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.recompute_budget_gib = recompute_budget_gib
 
     def forward(
         self,
@@ -169,8 +176,49 @@ class Nemotron4MIMOVisionEncoder(_WithoutTEExtraState, ViTModel):
         of the payload and is not used here.
         """
         del num_frames, expected_output_counts
+        if self.recompute_budget_gib is not None and self.training and torch.is_grad_enabled():
+            self._fit_recompute_to_budget(x.shape[1])
         # The ViT reads the patch grid on the host; MIMO payloads carry it on the GPU.
         return super().forward(x, imgs_sizes=imgs_sizes.cpu(), packed_seq_params=packed_seq_params)
+
+    def recompute_plan(self, patches: int) -> tuple[int, int]:
+        """Return ``(n_full, n_mlp)`` whose estimated activations of ``patches`` fit the budget.
+
+        Bytes kept per patch, measured on the NM4 ViT (BF16, fused SwiGLU and RoPE; hidden h, FFN f): a full
+        recompute layer 2.1h, an MLP-only recompute layer 14.5h, a layer without recompute 16.5h + 6f, the rest
+        of the encoder 6.5h. Layers move from full to MLP-only first (most recompute time saved per byte), then
+        from MLP-only to none. If even full recompute of all layers does not fit, all layers use it.
+        These estimates are calibrated only for a BF16 encoder; MXFP8 and other quantized encoders have not
+        been validated. The language decoder may independently use a different precision.
+        """
+        if not self.config.bf16 or self.config.fp8 or self.config.fp4 or self.config.quant_recipe is not None:
+            raise ValueError(
+                "vision_recompute_budget_gib requires a BF16 encoder with FP8, FP4, and quant_recipe disabled; "
+                "its activation estimates have not been validated for MXFP8 or other encoder precisions."
+            )
+        hidden, ffn = self.config.hidden_size, self.config.ffn_hidden_size
+        full, mlp, none = 2.1 * hidden, 14.5 * hidden, 16.5 * hidden + 6 * ffn
+        layer_budget = self.recompute_budget_gib * 2**30 / max(patches, 1) - 6.5 * hidden
+        n_layers = len(self.decoder.layers)
+
+        def fits(n_full: int, n_mlp: int) -> bool:
+            return n_full * full + n_mlp * mlp + (n_layers - n_full - n_mlp) * none <= layer_budget
+
+        n_full, n_mlp = n_layers, 0
+        while n_full > 0 and fits(n_full - 1, n_mlp + 1):
+            n_full, n_mlp = n_full - 1, n_mlp + 1
+        while n_full == 0 and n_mlp > 0 and fits(0, n_mlp - 1):
+            n_mlp -= 1
+        return n_full, n_mlp
+
+    def _fit_recompute_to_budget(self, patches: int) -> None:
+        # Core reads the layer count when this forward runs and ``recompute_mlp`` whenever a layer runs. If a
+        # later plan sets ``recompute_mlp`` on a layer that recomputes fully here, that backward also recomputes
+        # the MLP once more: slower, same values.
+        n_full, n_mlp = self.recompute_plan(patches)
+        self.config.recompute_num_layers = n_full
+        for index, layer in enumerate(self.decoder.layers):
+            layer.recompute_mlp = n_full <= index < n_full + n_mlp
 
 
 class Nemotron4MIMOProjector(_WithoutTEExtraState, MultimodalProjector):

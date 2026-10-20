@@ -33,6 +33,7 @@ from megatron.bridge.models.nemotron4.modeling_nemotron4_vl import (
     Nemotron4MIMOLanguageModel,
     Nemotron4MIMOProjector,
     Nemotron4MIMOVisionEncoder,
+    _build_vision_packed_seq_params,
 )
 from megatron.bridge.models.nemotron4.nemotron4_bridge import nemotron4_mimo_conversion_spec
 
@@ -275,6 +276,7 @@ def test_vision_encoder_takes_the_mimo_payload(monkeypatch):
     monkeypatch.setattr(ViTModel, "forward", vit_forward)
     encoder = object.__new__(Nemotron4MIMOVisionEncoder)
     torch.nn.Module.__init__(encoder)
+    encoder.recompute_budget_gib = None
     device = "cuda" if torch.cuda.is_available() else "cpu"
     x = torch.zeros(1, 8, 588, device=device)
     imgs_sizes = torch.tensor([[28, 28], [28, 28]], dtype=torch.int32, device=device)
@@ -308,3 +310,240 @@ def test_components_omit_te_extra_state(monkeypatch, component, parent):
     monkeypatch.setattr(parent, "sharded_state_dict", lambda self, *args, **kwargs: dict(state))
 
     assert object.__new__(component).sharded_state_dict(prefix="") == {"linear.weight": state["linear.weight"]}
+
+
+_BUDGETED_RECOMPUTE = dict(
+    recompute_vision=True,
+    vision_recompute_granularity="full",
+    vision_recompute_method="block",
+    vision_recompute_num_layers=1,
+    vision_bias_activation_fusion=True,
+    vision_apply_rope_fusion=True,
+)
+
+
+def test_vision_recompute_budget_reaches_only_the_mimo_encoder():
+    def encoder_params(**overrides):
+        images = _provider(**overrides).build_mimo_modality_submodules_spec()["images"]
+        return images.submodules["encoders"]["pixtral"].params
+
+    assert encoder_params(**_BUDGETED_RECOMPUTE, vision_recompute_budget_gib=105.0)["recompute_budget_gib"] == 105.0
+    with pytest.raises(ValueError, match="only by the MIMO vision encoder"):
+        _provider(**_BUDGETED_RECOMPUTE, vision_recompute_budget_gib=105.0).provide()
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        dict(recompute_vision=False),
+        dict(vision_recompute_granularity="selective"),
+        dict(vision_recompute_method="uniform"),
+        dict(vision_bias_activation_fusion=False),
+        dict(vision_apply_rope_fusion=False),
+        dict(vision_recompute_budget_gib=0.0),
+        dict(vision_recompute_budget_gib=float("inf")),
+    ],
+)
+def test_vision_recompute_budget_rejects_unsupported_settings(overrides):
+    provider = _provider(**{**_BUDGETED_RECOMPUTE, "vision_recompute_budget_gib": 105.0, **overrides})
+    with pytest.raises(ValueError, match="vision_recompute_budget_gib requires"):
+        provider.build_mimo_modality_submodules_spec()
+
+
+def _budgeted_encoder(budget_gib, hidden=2048, ffn=6144, layers=30):
+    encoder = object.__new__(Nemotron4MIMOVisionEncoder)
+    torch.nn.Module.__init__(encoder)
+    encoder.config = SimpleNamespace(
+        hidden_size=hidden,
+        ffn_hidden_size=ffn,
+        bf16=True,
+        fp8=None,
+        fp4=None,
+        quant_recipe=None,
+    )
+    encoder.decoder = SimpleNamespace(layers=[SimpleNamespace(recompute_mlp=False) for _ in range(layers)])
+    encoder.recompute_budget_gib = budget_gib
+    return encoder
+
+
+@pytest.mark.parametrize(
+    "precision",
+    [
+        dict(bf16=False),
+        dict(fp8="e4m3", fp8_recipe="mxfp8"),
+        dict(fp8="hybrid", fp8_recipe="tensorwise"),
+        dict(fp4="e2m1"),
+        dict(quant_recipe={}),
+    ],
+    ids=["non-bf16", "mxfp8", "tensorwise-fp8", "fp4", "quant-recipe"],
+)
+def test_recompute_budget_rejects_unvalidated_encoder_precision(precision):
+    encoder = _budgeted_encoder(105.0)
+    encoder.config = SimpleNamespace(**(vars(encoder.config) | precision))
+
+    with pytest.raises(ValueError, match="requires a BF16 encoder"):
+        encoder.recompute_plan(83_984)
+
+
+def test_recompute_budget_allows_mxfp8_decoder_with_bf16_encoder():
+    provider = _provider(
+        fp8="e4m3",
+        fp8_recipe="mxfp8",
+        fp8_param=True,
+        **_BUDGETED_RECOMPUTE,
+        vision_recompute_budget_gib=105.0,
+    )
+    spec = provider.build_mimo_modality_submodules_spec()["images"].submodules["encoders"]["pixtral"]
+    encoder = _budgeted_encoder(spec.params["recompute_budget_gib"], layers=provider.vision_num_layers)
+    encoder.config = spec.params["transformer_config"]
+
+    assert encoder.recompute_plan(1) == (0, 0)
+    assert provider.fp8 == "e4m3"
+    assert provider.fp8_recipe == "mxfp8"
+
+
+@pytest.mark.parametrize(
+    "patches,plan",
+    # 84k-99k: plans logged by the 18n run at 105 GiB (job 1293415).
+    [(1, (0, 0)), (83_984, (0, 20)), (93_184, (0, 23)), (98_956, (0, 25)), (199_000, (14, 16)), (10**7, (30, 0))],
+)
+def test_recompute_plan(patches, plan):
+    assert _budgeted_encoder(105.0).recompute_plan(patches) == plan
+
+
+def test_fit_sets_the_layer_count_and_mlp_switches():
+    encoder = _budgeted_encoder(105.0)
+    n_full, n_mlp = encoder.recompute_plan(199_000)
+    encoder._fit_recompute_to_budget(199_000)
+    assert encoder.config.recompute_num_layers == n_full
+    flags = [layer.recompute_mlp for layer in encoder.decoder.layers]
+    assert flags == [False] * n_full + [True] * n_mlp + [False] * (30 - n_full - n_mlp)
+
+
+@pytest.mark.gpu
+def test_budgeted_recompute_keeps_outputs_and_gradients_bitwise(tmp_path, monkeypatch):
+    """Training order F0 F1 B0 F2 B1 F3 B2 B3 with a different plan per micro-batch. Each forward must run its own
+    plan, and mb0's fully recomputed layers 0-1 replay in B0 with mb1's MLP-only switch. Outputs and gradients must
+    equal those without recompute."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires a GPU")
+    from megatron.core import parallel_state, tensor_parallel
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.transformer.enums import AttnBackend
+
+    # Deterministic cuDNN attention, so that two runs compare bitwise (production allows a non-deterministic
+    # backward). setenv restores these process-wide values after the test.
+    for name, value in (
+        ("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0"),
+        ("NVTE_FLASH_ATTN", "0"),
+        ("NVTE_FUSED_ATTN", "1"),
+        ("NVTE_UNFUSED_ATTN", "0"),
+    ):
+        monkeypatch.setenv(name, value)
+    torch.distributed.init_process_group("nccl", init_method=(tmp_path / "dist-init").as_uri(), rank=0, world_size=1)
+    try:
+        parallel_state.initialize_model_parallel()
+        tensor_parallel.model_parallel_cuda_manual_seed(1234)
+        provider = _provider(
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            **_BUDGETED_RECOMPUTE,
+            vision_recompute_budget_gib=1.0,
+        )
+        provider.attention_backend = AttnBackend.fused
+        provider.gradient_accumulation_fusion = False  # no DDP main_grad buffers here
+        provider.vision_num_layers = 4
+        provider.vision_hidden_size = 128
+        provider.vision_ffn_hidden_size = 256
+        provider.vision_kv_channels = 32
+        spec = provider.build_mimo_modality_submodules_spec()["images"].submodules["encoders"]["pixtral"]
+        encoder = spec.module(**spec.params, pg_collection=ProcessGroupCollection.use_mpu_process_groups())
+        encoder = encoder.cuda().bfloat16().train()
+        layers = encoder.decoder.layers
+        assert encoder.decoder.config is encoder.config
+        seen, mlp_seen, plan_calls = [], [], []
+        for index, layer in enumerate(layers):
+            layer.register_forward_pre_hook(
+                lambda module, args, index=index: seen.append(
+                    (index, torch.is_grad_enabled(), encoder.config.recompute_num_layers, module.recompute_mlp)
+                )
+            )
+            # The MLP runs without grad inside a checkpoint forward and with grad when it is replayed.
+            layer.mlp.register_forward_pre_hook(
+                lambda module, args, index=index: mlp_seen.append((index, torch.is_grad_enabled()))
+            )
+
+        generator = torch.Generator(device="cuda").manual_seed(0)
+        batches = []
+        for sizes in ([[56, 84], [28, 112]], [[112, 112], [28, 28]], [[84, 56]], [[56, 56], [28, 56], [84, 28]]):
+            imgs_sizes = torch.tensor(sizes, dtype=torch.int32, device="cuda")
+            patches = int((imgs_sizes // 14).prod(dim=1).sum())
+            x = torch.randn(1, patches, 588, generator=generator, device="cuda").bfloat16()
+            batches.append((x, imgs_sizes, _build_vision_packed_seq_params(imgs_sizes, 14, x.device)))
+        # (n_full, n_mlp) per micro-batch: all full, MLP-only + none, full + MLP-only, none.
+        wanted = [(4, 0), (0, 2), (2, 2), (0, 0)]
+
+        def run(budgeted):
+            encoder.config.recompute_granularity = "full" if budgeted else None
+            for layer in layers:
+                layer.recompute_mlp = False
+            encoder.zero_grad(set_to_none=True)
+            outputs, steps, grad_rng = {}, {}, torch.Generator(device="cuda").manual_seed(1)
+            mlp_steps = {}
+            for kind, mb in (("F", 0), ("F", 1), ("B", 0), ("F", 2), ("B", 1), ("F", 3), ("B", 2), ("B", 3)):
+                seen.clear()
+                mlp_seen.clear()
+                if kind == "F":
+                    encoder.recompute_budget_gib = 1.0 if budgeted else None
+
+                    def plan_of(patches, plan=wanted[mb]):
+                        plan_calls.append(patches)
+                        return plan
+
+                    monkeypatch.setattr(encoder, "recompute_plan", plan_of)
+                    x, imgs_sizes, packed = batches[mb]
+                    outputs[mb] = encoder(x=x, imgs_sizes=imgs_sizes, packed_seq_params=packed)
+                else:
+                    out = outputs[mb]
+                    out.backward(torch.randn(out.shape, generator=grad_rng, device="cuda").to(out.dtype))
+                steps[f"{kind}{mb}"] = sorted(seen)
+                mlp_steps[f"{kind}{mb}"] = sorted(mlp_seen)
+            grads = {name: param.grad.clone() for name, param in encoder.named_parameters()}
+            return [outputs[mb].detach() for mb in range(4)], grads, steps, mlp_steps
+
+        reference_outputs, reference_grads, _, _ = run(budgeted=False)
+        outputs, grads, steps, mlp_steps = run(budgeted=True)
+        # The planner sees the patch count of each micro-batch (only the budgeted run plans).
+        assert plan_calls == [batch[0].shape[1] for batch in batches]
+        # (layer, grad enabled, config.recompute_num_layers, layer.recompute_mlp) when each layer runs.
+        expected = {
+            f"F{mb}": [(i, i >= n_full, n_full, n_full <= i < n_full + n_mlp) for i in range(4)]
+            for mb, (n_full, n_mlp) in enumerate(wanted)
+        }
+        expected |= {
+            "B0": [(i, True, 0, i < 2) for i in range(4)],
+            "B1": [],
+            "B2": [(i, True, 0, False) for i in range(2)],
+            "B3": [],
+        }
+        assert steps == expected
+        # An MLP runs without grad when its layer or the MLP itself is checkpointed, and again with grad in the
+        # backward. B0: layers 0-1 replay with mb1's MLP-only switch, so their MLP checkpoints again.
+        mlp_expected = {
+            f"F{mb}": [(i, i >= n_full + n_mlp) for i in range(4)] for mb, (n_full, n_mlp) in enumerate(wanted)
+        }
+        mlp_expected |= {
+            "B0": [(0, False), (0, True), (1, False), (1, True), (2, True), (3, True)],
+            "B1": [(0, True), (1, True)],
+            "B2": [(i, True) for i in range(4)],
+            "B3": [],
+        }
+        assert mlp_steps == mlp_expected
+        for reference, output in zip(reference_outputs, outputs):
+            assert torch.equal(reference, output)
+        assert reference_grads.keys() == grads.keys()
+        for name in grads:
+            assert torch.equal(reference_grads[name], grads[name]), name
+    finally:
+        parallel_state.destroy_model_parallel()
+        torch.distributed.destroy_process_group()
