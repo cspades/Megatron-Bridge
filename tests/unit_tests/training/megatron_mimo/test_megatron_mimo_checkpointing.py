@@ -1108,6 +1108,7 @@ class TestMimoOptimizerLoadCompat:
 
     def _make_mimo_optimizer(self):
         from megatron.core.models.mimo.optimizer import MimoOptimizer, ModuleOptimizerInfo
+        from megatron.core.optimizer import OptimizerConfig
 
         opt_a = MagicMock()
         opt_b = MagicMock()
@@ -1127,8 +1128,7 @@ class TestMimoOptimizerLoadCompat:
             "language": ModuleOptimizerInfo(optimizer=opt_a, grid=Mock(), pg_collection=pg_collection, is_active=True),
             "vision": ModuleOptimizerInfo(optimizer=opt_b, grid=Mock(), pg_collection=pg_collection, is_active=True),
         }
-        config = MagicMock()
-        return MimoOptimizer(module_infos, config), opt_a, opt_b
+        return MimoOptimizer(module_infos, OptimizerConfig()), opt_a, opt_b
 
     def test_load_state_dict_dispatches_per_module(self):
         mimo_opt, opt_a, opt_b = self._make_mimo_optimizer()
@@ -1163,11 +1163,12 @@ class TestMimoOptimizerLoadCompat:
 
     def test_is_stub_optimizer_when_no_active(self):
         from megatron.core.models.mimo.optimizer import MimoOptimizer, ModuleOptimizerInfo
+        from megatron.core.optimizer import OptimizerConfig
 
         module_infos = {
             "language": ModuleOptimizerInfo(optimizer=None, grid=Mock(), pg_collection=Mock(), is_active=False),
         }
-        mimo_opt = MimoOptimizer(module_infos, MagicMock())
+        mimo_opt = MimoOptimizer(module_infos, OptimizerConfig())
         assert mimo_opt.is_stub_optimizer is True
 
 
