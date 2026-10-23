@@ -306,6 +306,41 @@ class TestMegatronMIMOProvider:
         # Should return equivalent results (not cached, but same structure)
         assert infra1.participating_modules == infra2.participating_modules
 
+    @pytest.mark.parametrize(
+        ("ranges", "rank", "group_ranks"),
+        [
+            ({"images": (0, 2), "language": (2, 3)}, 0, [0, 1, 4]),  # encoder rank
+            ({"images": (0, 2), "language": (2, 3)}, 4, [0, 1, 4]),  # last language rank: the source
+            ({"images": (0, 2), "language": (2, 3)}, 3, [0, 1, 4]),  # other language rank: not a member
+            ({"language": (0, 2), "images": (2, 1), "audio": (3, 2)}, 0, [1, 2, 3, 4]),  # two encoders
+            ({"images": (0, 3), "language": (0, 3)}, 0, None),  # colocated: every rank holds the language module
+        ],
+    )
+    @patch("torch.distributed.new_group")
+    @patch("torch.distributed.get_rank")
+    @patch("megatron.bridge.models.megatron_mimo.megatron_mimo_provider.build_hypercomm_grids")
+    def test_build_infra_num_tokens_broadcast_group(
+        self, mock_build_grids, mock_get_rank, mock_new_group, ranges, rank, group_ranks
+    ):
+        """The group holds the last language rank and the ranks without the language module."""
+        mock_get_rank.return_value = rank
+        mock_build_grids.return_value = {name: MagicMock(rank_offset=o, size=n) for name, (o, n) in ranges.items()}
+        provider = MegatronMIMOProvider(
+            language_model_spec=ModuleSpec(module=Mock, params={"config": Mock()}),
+            megatron_mimo_parallelism_config=Mock(),
+        )
+
+        with patch.object(provider, "_get_pg_collections_from_grids", return_value={}):
+            infra = provider.build_infra()
+
+        if group_ranks is None:
+            mock_new_group.assert_not_called()
+            assert infra.num_tokens_broadcast_group is None
+        else:
+            mock_new_group.assert_called_once_with(ranks=group_ranks)
+            member = rank in group_ranks
+            assert infra.num_tokens_broadcast_group is (mock_new_group.return_value if member else None)
+
     @patch("torch.distributed.new_group")
     @patch("torch.distributed.get_process_group_ranks")
     @patch("torch.distributed.get_rank")
@@ -586,6 +621,7 @@ class TestMegatronMIMOInfra:
             topology=topology,
             pg_collections=pg_collections,
             participating_modules=participating,
+            num_tokens_broadcast_group=None,
         )
 
         assert infra.module_to_grid_map == grids
@@ -932,7 +968,7 @@ def test_build_infra_selects_language_representative_log_rank(offset):
         with (
             patch(
                 "megatron.bridge.models.megatron_mimo.megatron_mimo_provider.build_hypercomm_grids",
-                return_value={"language": SimpleNamespace(rank_offset=offset)},
+                return_value={"language": SimpleNamespace(rank_offset=offset, size=4)},
             ),
             patch.object(provider, "_get_pg_collections_from_grids", return_value={}),
         ):

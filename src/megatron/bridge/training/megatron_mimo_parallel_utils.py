@@ -285,11 +285,13 @@ def finalize_model_grads_multimodule(
                             force_all_reduce=force_all_reduce,
                         )
 
-        # Phase 2: broadcast the correct global total from LLM to encoder
-        # ranks.  _finalize_model_grads updated num_tokens in-place on LLM
-        # ranks (PP broadcast + DP all-reduce → true global total).
-        llm_last_rank = llm_grid.rank_offset + llm_grid.size - 1
-        dist.broadcast(num_tokens, src=llm_last_rank)
+        # Phase 2: broadcast the correct global total from the last LLM rank
+        # to the ranks without the LLM.  _finalize_model_grads updated
+        # num_tokens in-place on LLM ranks (PP broadcast + DP all-reduce →
+        # true global total).  The other LLM ranks have no group and skip it.
+        if infra.num_tokens_broadcast_group is not None:
+            llm_last_rank = llm_grid.rank_offset + llm_grid.size - 1
+            dist.broadcast(num_tokens, src=llm_last_rank, group=infra.num_tokens_broadcast_group)
 
         # Phase 3: scale encoder gradients by 1 / global_total.
         for module, grid in module_to_grid_tuple:

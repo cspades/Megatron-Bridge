@@ -401,6 +401,7 @@ class TestFinalizeModelGradsMultimodule:
         mock_dist.broadcast.assert_called_once()
         assert mock_dist.broadcast.call_args.args[0] is num_tokens
         assert mock_dist.broadcast.call_args.kwargs["src"] == 7
+        assert mock_dist.broadcast.call_args.kwargs["group"] is s.infra.num_tokens_broadcast_group
 
         # Phase 3: encoder scaled by 1/total only; LLM already normalized by DDP.
         s.encoder_module.scale_gradients.assert_called_once_with(1.0 / 100)
@@ -515,3 +516,25 @@ class TestFinalizeModelGradsMultimodule:
 
         s.encoder_module.scale_gradients.assert_not_called()
         s.llm_module.scale_gradients.assert_not_called()
+
+    @patch(f"{MODULE}.dist")
+    @patch(f"{MODULE}.is_current_rank_in_grid")
+    @patch(f"{MODULE}._get_dp_size_from_grid")
+    @patch(f"{MODULE}._finalize_model_grads")
+    def test_per_token_loss_path_skips_broadcast_without_group(self, mock_finalize, mock_dp, mock_in_grid, mock_dist):
+        """A language rank outside the token-count group (not the source) skips the broadcast."""
+        from megatron.bridge.training.megatron_mimo_parallel_utils import finalize_model_grads_multimodule
+
+        s = _build_two_module_setup(llm_dp=2, encoder_dp=4)
+        s.infra.num_tokens_broadcast_group = None
+        mock_in_grid.side_effect = lambda grid: grid is s.llm_grid
+        mock_dp.side_effect = lambda grid: s.dp_by_grid[id(grid)]
+
+        finalize_model_grads_multimodule(
+            [MagicMock()],
+            torch.tensor(100),
+            infra=s.infra,
+            module_to_grid_tuple=s.module_to_grid_tuple,
+        )
+
+        mock_dist.broadcast.assert_not_called()

@@ -95,12 +95,15 @@ class MegatronMIMOInfra:
         pg_collections: Mapping of module names to ProcessGroupCollections.
             None for modules this rank doesn't participate in.
         participating_modules: List of module names this rank participates in.
+        num_tokens_broadcast_group: Group of the last language rank and the ranks without the
+            language module, for the token-count broadcast in finalize. None on other ranks.
     """
 
     module_to_grid_map: Dict[str, "HyperCommGrid"]
     topology: Dict[str, List[str]]
     pg_collections: Dict[str, Optional[ProcessGroupCollection]]
     participating_modules: List[str]
+    num_tokens_broadcast_group: dist.ProcessGroup | None
     module_output_ndim: Dict[str, int] = field(default_factory=dict)
 
 
@@ -276,11 +279,25 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
             MegatronMIMOInfra containing grids, topology, pg_collections,
             and the list of modules this rank participates in.
         """
+        num_tokens_broadcast_group = None
         if self.megatron_mimo_parallelism_config is not None:
             grids = build_hypercomm_grids(self.megatron_mimo_parallelism_config)
             language_grid = grids.get(MIMO_LANGUAGE_MODULE_KEY)
             set_default_log_ranks({0, language_grid.rank_offset} if language_grid is not None else {0})
             pg_collections = self._get_pg_collections_from_grids(grids)
+            # finalize_model_grads_multimodule broadcasts the global token count from the last language
+            # rank to the ranks without the language module. The other language ranks already hold it
+            # and stay out of the group. Colocated layouts build no group.
+            language_ranks = range(language_grid.rank_offset, language_grid.rank_offset + language_grid.size)
+            receivers = {
+                rank for grid in grids.values() for rank in range(grid.rank_offset, grid.rank_offset + grid.size)
+            }.difference(language_ranks)
+            if receivers:
+                ranks = sorted(receivers | {language_ranks[-1]})
+                # dist.new_group() is a collective on the default PG: all ranks call it.
+                group = dist.new_group(ranks=ranks)
+                if dist.get_rank() in ranks:
+                    num_tokens_broadcast_group = group
         else:
             grids = {}
             pg_collections = {}
@@ -311,6 +328,7 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
             pg_collections=pg_collections,
             participating_modules=participating_modules,
             module_output_ndim=output_ndim,
+            num_tokens_broadcast_group=num_tokens_broadcast_group,
         )
 
     def _get_pg_collections_from_grids(
