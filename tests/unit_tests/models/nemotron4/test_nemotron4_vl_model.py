@@ -33,6 +33,48 @@ def _provider_with_recompute(**overrides):
     return provider
 
 
+def _hybrid_spec(name: str):
+    """Return MCore's ``name`` spec, or its plain form on MCore without dedicated wide-residual layers."""
+    from megatron.core.models.hybrid import hybrid_layer_specs
+
+    return getattr(hybrid_layer_specs, name, None) or getattr(hybrid_layer_specs, name.removeprefix("wide_residual_"))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "transformer_impl,wide_residual,expected",
+    [
+        ("transformer_engine", False, "gated_delta_product_stack_spec"),
+        ("inference_optimized", False, "gated_delta_product_inference_stack_spec"),
+        ("transformer_engine", True, "wide_residual_gated_delta_product_stack_spec"),
+        ("inference_optimized", True, "wide_residual_gated_delta_product_inference_stack_spec"),
+    ],
+)
+def test_stack_spec_follows_transformer_impl_and_wide_residual(transformer_impl, wide_residual, expected):
+    config = SimpleNamespace(transformer_impl=transformer_impl, wide_residual=object() if wide_residual else None)
+
+    assert nm4_provider.nemotron4_stack_spec(config) is _hybrid_spec(expected)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "saved_spec", ["gated_delta_product_stack_spec", "wide_residual_gated_delta_product_inference_stack_spec"]
+)
+def test_saved_spec_resolves_to_the_running_variant(saved_spec):
+    config = SimpleNamespace(transformer_impl="inference_optimized", wide_residual=object())
+
+    resolved = nm4_provider._resolve_nemotron4_spec_variant(
+        "megatron.core.models.hybrid.hybrid_layer_specs", saved_spec, config
+    )
+
+    assert resolved is _hybrid_spec("wide_residual_gated_delta_product_inference_stack_spec")
+
+
+@pytest.mark.unit
+def test_stack_spec_without_config_is_the_training_spec():
+    assert nm4_provider.nemotron4_stack_spec() is _hybrid_spec("gated_delta_product_stack_spec")
+
+
 @pytest.mark.unit
 @pytest.mark.parametrize("builder", ["_build_vision_config", "_build_vision_projection_config"])
 def test_dense_configs_clear_language_controls_without_changing_language(builder: str) -> None:

@@ -116,6 +116,7 @@ def test_megatron_mimo_runtime_config_update_resolves_eval_batch_size_defaults()
     from megatron.bridge.training.config import megatron_mimo_runtime_config_update
 
     cfg = MagicMock()
+    cfg.dist.distributed_timeout_minutes = 10
     cfg.env_vars = {}
     cfg.train.num_epochs = None
     cfg.train.global_batch_size = 8
@@ -380,6 +381,7 @@ class TestPretrainMegatronMIMOSetup:
         mock_unwrap.return_value = unwrapped
 
         cfg = Mock()
+        cfg.dist.distributed_timeout_minutes = 10
         cfg.checkpoint = Mock()
         cfg.checkpoint.load = None
         cfg.checkpoint.pretrained_checkpoint = None
@@ -965,6 +967,7 @@ def _make_pretrain_cfg(
 ) -> MagicMock:
     """Create a ConfigContainer-like mock for pretrain_megatron_mimo tests."""
     cfg = MagicMock()
+    cfg.dist.distributed_timeout_minutes = 10
     cfg.train = SimpleNamespace(
         rampup_batch_size=None,
         global_batch_size=1,
@@ -1349,6 +1352,7 @@ class TestSetupMegatronMIMOCheckpointLoading:
         from megatron.bridge.training.setup_megatron_mimo import setup_megatron_mimo
 
         cfg = Mock()
+        cfg.dist.distributed_timeout_minutes = 10
         cfg.checkpoint = SimpleNamespace(
             load=load_path,
             pretrained_checkpoint=None,
@@ -1519,6 +1523,7 @@ class TestSetupMegatronMIMOResumeIterators:
         build_fn.__signature__ = inspect.signature(_sig_fn)
 
         cfg = Mock()
+        cfg.dist.distributed_timeout_minutes = 10
         cfg.checkpoint = SimpleNamespace(load=None, pretrained_checkpoint=None, non_persistent_ckpt_type=None)
         cfg.model = Mock(fp16=False, bf16=True)
         cfg.optimizer = Mock()
@@ -1602,6 +1607,7 @@ class TestSetupMegatronMIMOResumeIterators:
         build_fn = Mock(return_value=(iter([]), None))
 
         cfg = Mock()
+        cfg.dist.distributed_timeout_minutes = 10
         cfg.checkpoint = SimpleNamespace(load=None, pretrained_checkpoint=None, non_persistent_ckpt_type=None)
         cfg.model = Mock(fp16=False, bf16=True)
         cfg.optimizer = Mock()
@@ -1687,6 +1693,7 @@ class TestSetupMegatronMIMOResumeIterators:
         build_fn.__signature__ = inspect.signature(legacy_builder)
 
         cfg = Mock()
+        cfg.dist.distributed_timeout_minutes = 10
         cfg.checkpoint = SimpleNamespace(load=None, pretrained_checkpoint=None, non_persistent_ckpt_type=None)
         cfg.model = Mock(fp16=False, bf16=True)
         cfg.optimizer = Mock()

@@ -9,6 +9,7 @@ import pytest
 
 def _make_cfg():
     cfg = MagicMock()
+    cfg.dist.distributed_timeout_minutes = 10
     cfg.train.rampup_batch_size = None
     cfg.train.global_batch_size = 1
     cfg.train.micro_batch_size = 1

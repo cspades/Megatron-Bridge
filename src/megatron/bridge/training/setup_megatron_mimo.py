@@ -12,6 +12,7 @@ Key components:
 
 from __future__ import annotations
 
+import datetime
 import logging
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Callable, Dict, Iterator, List, Optional
@@ -227,6 +228,7 @@ def setup_megatron_mimo(
         model_config,
         dim_mapping={"s": 0, "b": 1, "h": 2},  # SBH mapping - matches MimoModel output
         module_output_ndim=megatron_mimo_infra.module_output_ndim,
+        timeout=datetime.timedelta(minutes=cfg.dist.distributed_timeout_minutes),
     )
 
     # Build pg_collection for schedule
