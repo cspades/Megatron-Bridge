@@ -26,6 +26,11 @@ streamwise wide residuals, shortcut MoE blocks, global-batch quantile balancing,
 tanh-clamped activations and the pre-up-projection MoE norm. The providers check
 for them explicitly, because a dataclass subclass would otherwise accept these
 settings as new, silently ignored fields on an MCore that lacks them.
+
+Attention is dense by default. Checkpoints trained with simplified sparse attention (SSA)
+(a learned single-head Q/K indexer choosing each query's top-k keys, run by MCore's CuTe
+kernels) use :func:`nemotron4_ssa_stack_spec` and ``experimental_attention_variant="ssa"``;
+``Nemotron4Bridge.provider_bridge`` sets both when the HF config has ``index_topk``.
 """
 
 import argparse
@@ -122,6 +127,59 @@ def nemotron4_stack_spec() -> ModuleSpec:
             "The installed megatron.core has no gated_delta_product_stack_spec, which Nemotron4 needs."
         ) from error
     return gated_delta_product_stack_spec
+
+
+# TransformerConfig fields required by MCore's simplified sparse attention.
+# The top-k and loss coefficient retain their historical dsa_ names in MCore.
+NEMOTRON4_SSA_REQUIRED_MCORE_FIELDS = (
+    "experimental_attention_variant",
+    "ssa_train_indexer_only",
+    "dsa_indexer_topk",
+    "dsa_indexer_loss_coeff",
+)
+
+# Indexer-loss settings of the sparse-attention stage-2 recipe (KL loss on the selected top-k
+# keys, coefficient 0.1). They only affect training; MCore's CuTe backend requires them to be set.
+NEMOTRON4_SSA_INDEXER_LOSS_COEFF = 0.1
+
+
+def require_nemotron4_ssa_mcore() -> None:
+    """Raise if the installed MCore cannot build Nemotron4's simplified sparse attention.
+
+    Raises:
+        RuntimeError: If an SSA TransformerConfig field or the SSA layer spec is missing.
+    """
+    require_nemotron4_mcore()
+    defined = {config_field.name for config_field in dataclasses.fields(MCoreTransformerConfig)}
+    missing = [name for name in NEMOTRON4_SSA_REQUIRED_MCORE_FIELDS if name not in defined]
+    if (
+        missing
+        or importlib.util.find_spec(
+            "megatron.core.transformer.experimental_attention_variant.simplified_sparse_attention_layer_specs"
+        )
+        is None
+    ):
+        raise RuntimeError(
+            "The installed megatron.core cannot build Nemotron4 sparse attention: it needs "
+            "experimental_attention_variant.simplified_sparse_attention_layer_specs (CuTe backend); "
+            f"missing TransformerConfig fields: {missing}."
+        )
+
+
+def nemotron4_ssa_stack_spec() -> ModuleSpec:
+    """Return the gated-delta-product stack spec with simplified sparse attention.
+
+    Identical to :func:`nemotron4_stack_spec` except that every attention layer (including the
+    MTP block's) is MCore's ``SimplifiedSparseAttention``: ordinary GQA projections whose core
+    attention attends to each query's top-k keys chosen by a learned single-head indexer.
+    A named function (not a lambda) so the provider stays serializable.
+    """
+    require_nemotron4_ssa_mcore()
+    from megatron.core.transformer.experimental_attention_variant.simplified_sparse_attention_layer_specs import (
+        gdp_ssa_stack_spec,
+    )
+
+    return gdp_ssa_stack_spec
 
 
 def nemotron4_nano_wide_residual() -> Any:
@@ -708,6 +766,7 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
                 if getattr(self, name) is None:
                     setattr(self, name, False)
         self._apply_gtp_weight_shards()
+        _require_single_tensor_parallel(self)
         requested_gtp = self.gtp_weight_remat_size
         requested_expert_gtp = self.expert_gtp_weight_remat_size
         super().finalize()
@@ -814,6 +873,28 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
         return model
 
 
+def _require_single_tensor_parallel(provider: "Nemotron4VLModelProvider") -> None:
+    """Reject tensor parallelism before any model is built.
+
+    Nemotron4 runs at TP=1 (weights may still be GTP-sharded): its attention has a single KV
+    group, the sparse-attention CuTe kernels and indexer require TP=1, the GDP weight mappings
+    refuse TP>1, and the projector config (one attention head) cannot be split. Without this
+    check TP>1 fails later, inside model construction, with a misleading head-count error.
+
+    Raises:
+        ValueError: If ``tensor_model_parallel_size`` is not 1.
+    """
+    if provider.tensor_model_parallel_size != 1:
+        sparse = getattr(provider, "experimental_attention_variant", None) == "ssa"
+        raise ValueError(
+            f"Nemotron4 requires tensor_model_parallel_size=1 (got {provider.tensor_model_parallel_size}): one KV "
+            "group, TP=1-only GDP conversion"
+            + (" and the CuTe sparse-attention kernels" if sparse else "")
+            + ". Use expert parallelism, context parallelism or GTP weight sharding "
+            "(gtp_weight_remat_size) instead."
+        )
+
+
 def _make_dense_non_hybrid(config: MCoreTransformerConfig) -> None:
     """Strip language-only architecture from an encoder/projector config copy.
 
@@ -843,6 +924,12 @@ def _make_dense_non_hybrid(config: MCoreTransformerConfig) -> None:
     config.use_fused_weighted_squared_relu = False
     config.wide_residual = None
     config.residual_stream_recompute_num_layers = None
+    # The ViT and projector use ordinary dense attention; the language model's sparse-attention
+    # settings would otherwise fail the CuTe SSA validation for their head geometry.
+    if getattr(config, "experimental_attention_variant", None) is not None:
+        config.experimental_attention_variant = None
+    if getattr(config, "ssa_train_indexer_only", False):
+        config.ssa_train_indexer_only = False
     if config.recompute_modules is not None:
         decoder_only = {"residual_stream", "shortcut_pre_mlp_layernorm"}
         config.recompute_modules = [module for module in config.recompute_modules if module not in decoder_only]

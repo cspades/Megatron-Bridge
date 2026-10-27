@@ -1574,6 +1574,12 @@ class MegatronModelBridge(
                 # "a leaf Variable that requires grad is being used in an in-place operation."
                 with torch.no_grad(), _gtp_weight_load_context(task.param_weight, task.megatron_module):
                     task.param_weight.copy_(converted_weights)
+                    # Keep the pre-quantization initializer consistent with imported HF
+                    # weights when optimizer construction follows this import.
+                    get_init = getattr(task.param_weight, "get_high_precision_init_val", None)
+                    init = get_init() if get_init is not None else None
+                    if init is not None:
+                        init.copy_(converted_weights.detach())
         self.finalize_hf_import(megatron_model)
         if use_megatron_fsdp:
             for m in original_megatron_model:

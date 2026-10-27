@@ -28,6 +28,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.utils import unwrap_model
 from transformers.configuration_utils import PretrainedConfig
 
 from megatron.bridge.models.conversion.auto_bridge import (
@@ -554,7 +555,7 @@ class MegatronMIMOBridge(AutoBridge):
 
         tasks: list[MIMOConversionTask] = []
         for route, pg_collection in _iter_active_routes(self.routes, infra.pg_collections):
-            submodule = mimo_model.get_submodule(route.target_module_path)
+            submodule = _get_route_submodule(mimo_model, route.target_module_path)
             wrapped = make_route_local_bridge(self._model_bridge, route)
             with _bridged_parallel_state(pg_collection), component_pg_context(submodule, pg_collection):
                 for task in wrapped.build_conversion_tasks(hf_pretrained, [submodule]):
@@ -831,6 +832,14 @@ def _iter_active_routes(
         yield route, pg_collection
 
 
+def _get_route_submodule(model: nn.Module, target: str) -> nn.Module:
+    """Resolve a conversion route through component DDP/mixed-precision wrappers."""
+    module = model
+    for name in target.split("."):
+        module = unwrap_model(module).get_submodule(name)
+    return unwrap_model(module)
+
+
 def import_hf_to_megatron_mimo(
     *,
     source_bridge: "MegatronModelBridge",
@@ -849,7 +858,7 @@ def import_hf_to_megatron_mimo(
     bind_hf_source_to_bridge(source_bridge, hf_pretrained)
 
     for route, pg_collection in _iter_active_routes(routes, pg_collections):
-        submodule = mimo_model.get_submodule(route.target_module_path)
+        submodule = _get_route_submodule(mimo_model, route.target_module_path)
         wrapped = make_route_local_bridge(source_bridge, route)
 
         logger.info(
@@ -892,7 +901,7 @@ def export_megatron_mimo_to_hf(
     bind_hf_source_to_bridge(source_bridge, hf_pretrained)
 
     for route, pg_collection in _iter_active_routes(routes, pg_collections):
-        submodule = mimo_model.get_submodule(route.target_module_path)
+        submodule = _get_route_submodule(mimo_model, route.target_module_path)
         wrapped = make_route_local_bridge(source_bridge, route)
 
         logger.info(

@@ -20,6 +20,7 @@ from typing import Iterable, List, Optional, Tuple
 
 import torch
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.transformer_config import TransformerConfig
 from rich.table import Table
 from transformers.configuration_utils import PretrainedConfig
 
@@ -366,6 +367,17 @@ def get_causal_lm_class_name_via_auto_map(
         return str(auto_map_class).split(".")[-1]
 
     return None
+
+
+def hf_mtp_layer_count(config: TransformerConfig) -> int:
+    """Return the HF ``num_nextn_predict_layers``: the MTP layers saved in the checkpoint.
+
+    Megatron's ``mtp_num_layers`` counts the tokens training predicts; a repeated MTP layer is saved once.
+    """
+    mtp_num_layers = int(config.mtp_num_layers or 0)
+    if mtp_num_layers > 0 and getattr(config, "mtp_use_repeated_layer", False):
+        mtp_num_layers = 1
+    return mtp_num_layers
 
 
 def conform_config_to_reference(

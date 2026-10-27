@@ -140,6 +140,7 @@ def setup_megatron_mimo(
     build_data_iterators_fn: Optional[Callable] = None,
     *,
     use_layer_wise_param_layout: bool = True,
+    model_init_fn: Optional[Callable] = None,
 ) -> MegatronMIMOSetupOutput:
     """MegatronMIMO-specific setup helper.
 
@@ -158,6 +159,8 @@ def setup_megatron_mimo(
             create the optimizer.
         build_data_iterators_fn: Optional function to build data iterators.
             Should have signature: (cfg, megatron_mimo_infra) -> (train_iter, valid_iter)
+        model_init_fn: Optional weight initializer called after component groups and model
+            construction, before optimizer master parameters are created.
         use_layer_wise_param_layout: With ``cfg.optimizer.use_layer_wise_distributed_optimizer``,
             use shard-aligned DDP buffers. False keeps the default DDP buffers (compact
             layer-wise optimizer), as ``use_layer_wise_param_layout`` does for ``get_model``.
@@ -242,6 +245,9 @@ def setup_megatron_mimo(
             "MimoModelConfig.module_to_grid_map must be set at model construction time. "
             "Ensure MegatronMIMOProvider.provide() passes module_to_grid_map for MegatronMIMO parallelism."
         )
+
+    if model_init_fn is not None:
+        model_init_fn(unwrapped_model, megatron_mimo_infra)
 
     logger.info(f"Rank {dist.get_rank()}: Creating MimoOptimizer")
     from megatron.core.models.mimo.optimizer import get_mimo_optimizer

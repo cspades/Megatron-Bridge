@@ -43,6 +43,16 @@ uv run python -m torch.distributed.run --standalone --nproc_per_node=2 \
   while the decoder's ordinary weights use BF16.
 - Quantile-balancing bin bounds have no HF counterpart and are not preserved
   through HF export/import. Router weights and expert correction biases are preserved.
+- Sparse attention: when the HF text config sets `index_topk`, every decoder and
+  MTP attention layer uses MCore's `ssa` variant (CuTe backend, BF16 indexers).
+  The indexer projections (`self_attn.indexer.{q,k}_proj`) convert one-to-one.
+  This requires MCore's `simplified_sparse_attention_layer_specs.gdp_ssa_stack_spec`
+  and `simplified-sparse-attention >=0.1.0.dev6` at execution time. Supported
+  geometry is top-k 512/1024/2048, indexer width 128, 16/32/96 query heads,
+  one KV head, and attention head dimension 256, at TP1 with all-gather CP.
+  Packed inputs carry logical and padded cumulative lengths; MCore derives
+  valid-token rows from these lengths. Full GPU conversion/training validation
+  of the SSA API port is pending.
 - Conversion covers model weights, not optimizer/RNG state or training resume.
 - These commands produce Bridge MIMO checkpoints. Loading them directly with the
   fork's separate `examples/mimo/pretrain_mimo.py` launcher is not established;

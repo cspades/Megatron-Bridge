@@ -29,6 +29,7 @@ from megatron.bridge.models.conversion.param_mapping import (
     QKVMapping,
     RowParallelMapping,
 )
+from megatron.bridge.models.conversion.utils import hf_mtp_layer_count
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.hybrid.hybrid_provider import HybridModelProvider
 
@@ -443,11 +444,7 @@ class NemotronHBridge(MegatronModelBridge):
 
         # Megatron uses None="not set/disabled", but HF modeling code expects integers
         # and will crash on None (e.g. n_routed_experts // n_group → TypeError)
-        mtp_num_layers = int(hf_cfg.get("num_nextn_predict_layers") or 0)
-        # HF serializes the physical shared block; recipes set its training repetitions.
-        if mtp_num_layers > 0 and getattr(provider, "mtp_use_repeated_layer", False):
-            mtp_num_layers = 1
-        hf_cfg["num_nextn_predict_layers"] = mtp_num_layers
+        hf_cfg["num_nextn_predict_layers"] = hf_mtp_layer_count(provider)
         hf_cfg["n_group"] = hf_cfg.get("n_group") or 1
         hf_cfg["topk_group"] = hf_cfg.get("topk_group") or 1
 

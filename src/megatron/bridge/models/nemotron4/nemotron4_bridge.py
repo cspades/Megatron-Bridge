@@ -45,10 +45,17 @@ When the HF config has MTP, ``mtp.layers.i`` maps one-to-one: ``enorm``,
 ``mtp_model_layer.layers.0`` to HF's ``block`` -- a shortcut attention + MoE
 block on an ordinary residual, i.e. the backbone block's tensors without the
 wide-residual controllers.
+
+Sparse attention: when the HF text config sets ``index_topk``, every attention
+layer (backbone and MTP) uses simplified sparse attention (SSA) -- a learned
+single-head indexer (``index_head_dim`` wide, plain dot-product scores) picks
+each query's top-k causal keys. Its two projections map one-to-one:
+``core_attention.indexer.linear_{q,k}.weight`` <-> ``self_attn.indexer.{q,k}_proj.weight``.
+With ``index_topk`` unset the model is dense and has no indexer.
 """
 
 import logging
-from typing import Mapping
+from typing import Any, Mapping
 
 import torch
 from torch import nn
@@ -65,12 +72,19 @@ from megatron.bridge.models.conversion.param_mapping import (
     ReplicatedMapping,
     RowParallelMapping,
 )
+from megatron.bridge.models.conversion.utils import hf_mtp_layer_count
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.megatron_mimo.conversion import MIMOComponent, register_mimo_conversion_spec
 from megatron.bridge.models.megatron_mimo.megatron_mimo_config import MegatronMIMOParallelismConfig
 from megatron.bridge.models.megatron_mimo.megatron_mimo_provider import MegatronMIMOProvider
 from megatron.bridge.models.nemotron4.modeling_nemotron4_vl import Nemotron4VLModel
-from megatron.bridge.models.nemotron4.nemotron4_provider import Nemotron4VLModelProvider, require_nemotron4_mcore
+from megatron.bridge.models.nemotron4.nemotron4_provider import (
+    NEMOTRON4_SSA_INDEXER_LOSS_COEFF,
+    Nemotron4VLModelProvider,
+    nemotron4_ssa_stack_spec,
+    require_nemotron4_mcore,
+    require_nemotron4_ssa_mcore,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -86,6 +100,35 @@ _LAYER_TYPE_TO_PATTERN = {
 
 # Synthesized HF name prefix for Megatron-only state; never present in an HF checkpoint.
 _MEGATRON_ONLY_PREFIX = "megatron_only::"
+
+# Shapes supported by MCore's CuTe SSA kernels.
+_SSA_TOPK_VALUES = (512, 1024, 2048)
+_SSA_QUERY_HEADS = (16, 32, 96)
+_SSA_HEAD_DIM = 256
+_SSA_INDEX_HEAD_DIM = 128
+
+
+def ssa_provider_kwargs(text_config: Any) -> dict[str, Any]:
+    """Return the provider fields for simplified sparse attention, or ``{}`` for dense attention.
+
+    The HF indexer is one learned query head and one learned key head of ``index_head_dim``,
+    scored by a plain dot product (no Hadamard rotation, ReLU, weights or RoPE), selecting
+    ``index_topk`` keys per query. MCore's SSA implementation fixes this indexer architecture
+    and uses CuTe kernels with sparse KL loss; only top-k and the loss coefficient are configurable here.
+    """
+    index_topk = getattr(text_config, "index_topk", None)
+    if index_topk is None:
+        return {}
+    return {
+        "hybrid_stack_spec": nemotron4_ssa_stack_spec,
+        "experimental_attention_variant": "ssa",
+        "dsa_indexer_topk": index_topk,
+        "dsa_indexer_loss_coeff": NEMOTRON4_SSA_INDEXER_LOSS_COEFF,
+        # SSA's context parallelism supports only all-gather; it is what training used.
+        "cp_comm_type": "all_gather",
+        # Nemotron4 has no position embedding.
+        "apply_rope_fusion": False,
+    }
 
 
 def layer_types_to_hybrid_pattern(layer_types: list[str]) -> str:
@@ -250,7 +293,9 @@ class Nemotron4Bridge(MegatronModelBridge):
         """Build a :class:`Nemotron4VLModelProvider` from the HF config.
 
         MTP layers are built exactly when the HF config has them
-        (``num_nextn_predict_layers``), one ``*E`` pattern depth each.
+        (``num_nextn_predict_layers``), one ``*E`` pattern depth each. Sparse
+        attention is configured exactly when ``text_config.index_topk`` is set
+        (see :func:`ssa_provider_kwargs`); otherwise the provider is unchanged.
 
         Raises:
             ValueError: If the HF config uses a setting this bridge cannot represent.
@@ -262,6 +307,10 @@ class Nemotron4Bridge(MegatronModelBridge):
         text = hf_config.text_config
         vision = hf_config.vision_config
         _validate_hf_config(hf_config)
+
+        sparse_attention = ssa_provider_kwargs(text)
+        if sparse_attention:
+            require_nemotron4_ssa_mcore()
 
         mtp_depths = getattr(text, "num_nextn_predict_layers", 0)
         pattern = layer_types_to_hybrid_pattern(list(text.layer_types))
@@ -317,7 +366,20 @@ class Nemotron4Bridge(MegatronModelBridge):
             img_h=vision.image_size,
             img_w=vision.image_size,
             vision_projection_ffn_hidden_size=None,
+            **sparse_attention,
         )
+
+    @classmethod
+    def megatron_to_hf_config(cls, provider) -> dict:
+        hf_cfg = super().megatron_to_hf_config(provider)
+        hf_cfg["num_nextn_predict_layers"] = hf_mtp_layer_count(provider)
+        hf_cfg.setdefault("text_config", {}).update(
+            index_topk=provider.dsa_indexer_topk
+            if getattr(provider, "experimental_attention_variant", None) == "ssa"
+            else None,
+            index_head_dim=_SSA_INDEX_HEAD_DIM,
+        )
+        return hf_cfg
 
     def maybe_modify_loaded_hf_weight(
         self, hf_param: str | dict[str, str], hf_state_dict: Mapping[str, torch.Tensor]
@@ -393,6 +455,16 @@ class Nemotron4Bridge(MegatronModelBridge):
                 *controllers(residual, hf_residual),
             ]
 
+        def indexer(compute: str, hf: str) -> list[MegatronParamMapping]:
+            """Sparse-attention indexer projections; replicated across TP in MCore."""
+            if getattr(text, "index_topk", None) is None:
+                return []
+            megatron_indexer = f"{compute}.self_attention.core_attention.indexer"
+            return [
+                ReplicatedMapping(f"{megatron_indexer}.linear_q.weight", f"{hf}.self_attn.indexer.q_proj.weight"),
+                ReplicatedMapping(f"{megatron_indexer}.linear_k.weight", f"{hf}.self_attn.indexer.k_proj.weight"),
+            ]
+
         def attention(compute: str, hf: str) -> list[MegatronParamMapping]:
             return [
                 AutoMapping(f"{compute}.self_attention.linear_qkv.layer_norm_weight", f"{hf}.input_layernorm.weight"),
@@ -403,6 +475,7 @@ class Nemotron4Bridge(MegatronModelBridge):
                     v=f"{hf}.self_attn.v_proj.weight",
                 ),
                 RowParallelMapping(f"{compute}.self_attention.linear_proj.weight", f"{hf}.self_attn.o_proj.weight"),
+                *indexer(compute, hf),
             ]
 
         def shortcut_moe(block: str, hf: str) -> list[MegatronParamMapping]:
@@ -545,6 +618,34 @@ def _validate_hf_config(hf_config) -> None:
         )
     if vision.num_attention_heads * vision.head_dim != vision.hidden_size:
         raise ValueError("Nemotron4 vision_config requires num_attention_heads * head_dim == hidden_size.")
+    _validate_sparse_attention(text)
+
+
+def _validate_sparse_attention(text_config: Any) -> None:
+    """Reject sparse-attention settings MCore's CuTe SSA backend cannot run.
+
+    ``index_topk=None`` (dense attention) needs nothing. Otherwise the kernels fix the top-k,
+    the indexer width and the attention geometry.
+    """
+    index_topk = getattr(text_config, "index_topk", None)
+    if index_topk is None:
+        return
+    problems = []
+    if index_topk not in _SSA_TOPK_VALUES:
+        problems.append(f"index_topk={index_topk} (supported: {_SSA_TOPK_VALUES})")
+    if text_config.index_head_dim != _SSA_INDEX_HEAD_DIM:
+        problems.append(f"index_head_dim={text_config.index_head_dim} (supported: {_SSA_INDEX_HEAD_DIM})")
+    if text_config.num_attention_heads not in _SSA_QUERY_HEADS:
+        problems.append(f"num_attention_heads={text_config.num_attention_heads} (supported: {_SSA_QUERY_HEADS})")
+    if text_config.num_key_value_heads != 1:
+        problems.append(f"num_key_value_heads={text_config.num_key_value_heads} (supported: 1)")
+    if text_config.head_dim != _SSA_HEAD_DIM:
+        problems.append(f"head_dim={text_config.head_dim} (supported: {_SSA_HEAD_DIM})")
+    if problems:
+        raise ValueError(
+            "Nemotron4 sparse attention (index_topk set) maps to MCore's CuTe SSA backend, which does not "
+            f"support: {', '.join(problems)}."
+        )
 
 
 @register_mimo_conversion_spec(Nemotron4Bridge)
