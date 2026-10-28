@@ -62,7 +62,7 @@ def _ignore_transformer_engine_extra_state(module: torch.nn.Module, incompatible
                 keys.remove(key)
 
 
-def _build_vision_packed_seq_params(imgs_sizes: torch.Tensor, patch_dim: int) -> PackedSeqParams:
+def _build_vision_packed_seq_params(imgs_sizes: torch.Tensor, patch_dim: int, device: torch.device) -> PackedSeqParams:
     """Build RADIO's per-image THD boundaries from image sizes."""
 
     sizes = imgs_sizes.tolist()
@@ -71,7 +71,7 @@ def _build_vision_packed_seq_params(imgs_sizes: torch.Tensor, patch_dim: int) ->
     for sequence_length in sequence_lengths:
         cumulative_lengths.append(cumulative_lengths[-1] + sequence_length)
 
-    cu_seqlens = torch.tensor(cumulative_lengths, dtype=torch.int32, device=imgs_sizes.device)
+    cu_seqlens = torch.tensor(cumulative_lengths, dtype=torch.int32, device=device)
     max_seqlen = max(sequence_lengths, default=0)
     return PackedSeqParams(
         qkv_format="thd",
@@ -466,7 +466,7 @@ class NemotronOmniModel(MegatronModule):
         if imgs_sizes is not None and imgs_sizes.numel() > 0:
             images = self._patchify_dynamic_images(images, imgs_sizes)
             if vision_packed_seq_params is None:
-                vision_packed_seq_params = _build_vision_packed_seq_params(imgs_sizes, self.patch_dim)
+                vision_packed_seq_params = _build_vision_packed_seq_params(imgs_sizes, self.patch_dim, images.device)
             use_temporal = getattr(self.vision_model, "temporal_patch_dim", 1) > 1
             if use_temporal and num_frames is None:
                 raise ValueError(
